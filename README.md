@@ -129,6 +129,7 @@ The local CA key stays at `proxy/.cache/ca-key.pem` (mode 0600). Only `cloudcode
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `API_PROVIDER` | No | `kimi` | Default backend |
+| `DEEPANTIGRAVITY_PORT` | No | `443` | Proxy listen port (keep at 443) |
 | `KIMI_API_KEY` | For Kimi | — | API key |
 | `KIMI_MODEL` | No | `kimi-for-coding` | Model name |
 | `NVIDIA_API_KEY` | For Nvidia | — | API key |
