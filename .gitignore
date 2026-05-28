@@ -1,6 +1,29 @@
-proxy/.env
-proxy/.cache/
+# Dependencies
 proxy/node_modules/
 proxy/package-lock.json
+
+# Environment / secrets
+proxy/.env
+
+# Generated certs and cache
+proxy/.cache/
+
+# Logs
 *.log
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Playwright MCP artifacts
+.playwright-mcp/
+
+# Antigravity CLI local config
+.antigravitycli/
