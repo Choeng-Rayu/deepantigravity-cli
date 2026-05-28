@@ -126,6 +126,8 @@ This logs request/response bodies to `proxy/.cache/requests/` and shows translat
 
 ## Troubleshooting
 
+For detailed solutions, see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
+
 ### "another deepantigravity session is already running"
 
 Only one session can run at a time. Check what's running:
