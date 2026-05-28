@@ -9,6 +9,7 @@ Step-by-step practical guide. For architecture details, see `README.md`.
 ```bash
 ./deepantigravity.sh -b kimi      # use Kimi Code
 ./deepantigravity.sh -b nv        # use Nvidia NIM
+./deepantigravity.sh --help       # show all options
 agy                                # use real Gemini (unchanged)
 ```
 
