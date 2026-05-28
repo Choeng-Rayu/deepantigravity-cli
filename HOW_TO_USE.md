@@ -179,6 +179,12 @@ Node lost its port-binding capability:
 ./deepantigravity.sh --setup      # re-grants CAP_NET_BIND_SERVICE
 ```
 
+### Nuclear reset (if everything is broken)
+
+```bash
+./deepantigravity.sh --teardown && rm -rf proxy/.cache && ./deepantigravity.sh --setup
+```
+
 ---
 
 ## Uninstall
