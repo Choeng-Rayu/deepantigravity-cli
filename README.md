@@ -157,6 +157,7 @@ deepantigravity-cli/
 ├── deepantigravity.ps1         # Main launcher (Windows)
 ├── HOW_TO_USE.md               # Practical usage guide
 ├── TROUBLESHOOTING.md          # Common issues and fixes
+├── CONTRIBUTING.md             # How to contribute
 ├── proxy/
 │   ├── .env.example            # Template for API keys
 │   ├── cert.js                 # CA + leaf cert generator
