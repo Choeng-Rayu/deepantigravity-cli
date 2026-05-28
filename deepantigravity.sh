@@ -58,26 +58,21 @@ DEFAULT_BACKEND="${API_PROVIDER:-kimi}"
 BACKEND="$DEFAULT_BACKEND"
 ACTION="launch"
 # ── Shared-session state ──
-# Many `deepantigravity` launches can share ONE proxy as long as they
-# all request the same backend (only one process can bind 127.0.0.1:443
-# and /etc/hosts has only one redirect target). The first launch starts
-# the proxy as a detached daemon; subsequent launches join as members;
-# the last launch to exit tears everything down. State lives under:
-#   proxy/.cache/session/
-#     ├─ lock            flock target for atomic operations
-#     ├─ proxy.pid       PID of the detached proxy (cleaned up by last-out)
-#     ├─ backend         backend name (kimi or nvidia)
-#     ├─ ca-bundle.pem   combined CA (our local CA + system trust store)
-#     ├─ proxy.log       proxy stdout+stderr
-#     └─ members/        one empty file named <PID> per active session
-SESSION_DIR="$SCRIPT_DIR/proxy/.cache/session"
-SESSION_LOCK="$SESSION_DIR/lock"
-SESSION_PROXY_PID="$SESSION_DIR/proxy.pid"
-SESSION_BACKEND="$SESSION_DIR/backend"
-SESSION_BUNDLE="$SESSION_DIR/ca-bundle.pem"
-SESSION_LOG="$SESSION_DIR/proxy.log"
-SESSION_MEMBERS="$SESSION_DIR/members"
-JOINED_SESSION=0    # 1 if we registered ourselves as a session member
+# Each backend can have its own running proxy bound to a unique loopback
+# IP. Multiple terminals using the SAME backend share that backend's
+# proxy (refcounted). DIFFERENT backends run in parallel because each
+# session uses a `bwrap` mount-namespace to give itself a custom
+# /etc/hosts pointing cloudcode-pa.googleapis.com at its backend's IP.
+# State lives under:
+#   proxy/.cache/sessions/<backend>/
+#     ├─ lock         flock target for atomic operations
+#     ├─ proxy.pid    PID of the detached proxy (cleaned up by last-out)
+#     ├─ proxy.log    proxy stdout+stderr
+#     └─ members/     one empty file named <PID> per active session
+SESSIONS_ROOT="$SCRIPT_DIR/proxy/.cache/sessions"
+CA_BUNDLE_PATH="$SCRIPT_DIR/proxy/.cache/ca-bundle.pem"
+JOINED_BACKEND=""    # set to backend name once we register as a member
+TMP_HOSTS_FILE=""    # per-session /etc/hosts file, bind-mounted by bwrap
 
 # ── Parse args ──
 PASS_ARGS=()
@@ -127,11 +122,29 @@ hosts_present() {
 
 # Count alive members in $SESSION_MEMBERS, garbage-collecting any whose
 # PID is dead (e.g. SIGKILL'd sessions that couldn't run their trap).
-# Echoes the count.
-session_active_member_count() {
+# ── Per-backend session helpers ──
+# Each backend gets a unique loopback IP. agy inside its bwrap mount-ns
+# resolves cloudcode-pa.googleapis.com to this IP via a custom /etc/hosts.
+backend_ip() {
+    case "$1" in
+        kimi)   echo "127.0.10.1" ;;
+        nvidia) echo "127.0.20.1" ;;
+        *)      echo "127.0.0.1" ;;
+    esac
+}
+backend_dir()      { echo "$SESSIONS_ROOT/$1"; }
+backend_lock()     { echo "$SESSIONS_ROOT/$1/lock"; }
+backend_pid_file() { echo "$SESSIONS_ROOT/$1/proxy.pid"; }
+backend_log_file() { echo "$SESSIONS_ROOT/$1/proxy.log"; }
+backend_members()  { echo "$SESSIONS_ROOT/$1/members"; }
+
+# Echoes count of alive member-PIDs for this backend, GCing dead ones.
+backend_active_count() {
+    local backend="$1"
+    local mdir; mdir="$(backend_members "$backend")"
     local count=0
-    if [[ -d "$SESSION_MEMBERS" ]]; then
-        for f in "$SESSION_MEMBERS"/*; do
+    if [[ -d "$mdir" ]]; then
+        for f in "$mdir"/*; do
             [[ -e "$f" ]] || continue
             local pid; pid="$(basename "$f")"
             if kill -0 "$pid" 2>/dev/null; then
@@ -144,48 +157,55 @@ session_active_member_count() {
     echo "$count"
 }
 
-# Atomically (under flock) remove our member file. If we're the last
-# active member, kill the proxy and remove /etc/hosts entries.
-session_leave() {
-    [[ "$JOINED_SESSION" -eq 1 ]] || return 0
-    [[ -d "$SESSION_DIR" ]] || return 0
+# Echoes list of all backends with a session directory present.
+backend_active_list() {
+    [[ -d "$SESSIONS_ROOT" ]] || return 0
+    for d in "$SESSIONS_ROOT"/*/; do
+        [[ -d "$d" ]] || continue
+        basename "$d"
+    done
+}
+
+# Atomically (under that backend's flock) remove our member file. If
+# we're the last member, kill the proxy and remove the backend's dir.
+backend_session_leave() {
+    local backend="$1"
+    [[ -n "$backend" ]] || return 0
+    local bdir; bdir="$(backend_dir "$backend")"
+    [[ -d "$bdir" ]] || return 0
     {
         if ! flock -w 5 9; then
-            # Best-effort: at least drop our member file even without
-            # the lock, so we don't pollute the refcount forever.
-            rm -f "$SESSION_MEMBERS/$$" 2>/dev/null || true
+            # Best-effort: drop our member file even without the lock.
+            rm -f "$(backend_members "$backend")/$$" 2>/dev/null || true
             return 0
         fi
-        rm -f "$SESSION_MEMBERS/$$"
-        local active; active=$(session_active_member_count)
+        rm -f "$(backend_members "$backend")/$$"
+        local active; active="$(backend_active_count "$backend")"
         if [[ "$active" -gt 0 ]]; then
             return 0
         fi
-        # We're the last one out — tear down.
-        if [[ -f "$SESSION_PROXY_PID" ]]; then
-            local proxy_pid; proxy_pid=$(cat "$SESSION_PROXY_PID" 2>/dev/null || true)
-            if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>/dev/null; then
-                # SIGKILL because Node's HTTP server graceful shutdown blocks
-                # on long-lived SSE connections from agy.
-                kill -9 "$proxy_pid" 2>/dev/null || true
+        # Last out — kill that backend's proxy and remove its dir.
+        local pid_file; pid_file="$(backend_pid_file "$backend")"
+        if [[ -f "$pid_file" ]]; then
+            local pp; pp="$(cat "$pid_file" 2>/dev/null || true)"
+            if [[ -n "$pp" ]] && kill -0 "$pp" 2>/dev/null; then
+                kill -9 "$pp" 2>/dev/null || true
             fi
         fi
-        if helper_installed && hosts_present; then
-            sudo -n "$HELPER_INSTALLED" remove 2>/dev/null || true
-        fi
-        # Remove session state (keep proxy.log around briefly for post-mortem
-        # in debug mode — it'll be wiped on next session start).
-        rm -f "$SESSION_PROXY_PID" "$SESSION_BACKEND" "$SESSION_BUNDLE"
-        rm -rf "$SESSION_MEMBERS"
-        rmdir "$SESSION_DIR" 2>/dev/null || true
-    } 9>"$SESSION_LOCK"
-    JOINED_SESSION=0
+        rm -rf "$bdir"
+    } 9>"$(backend_lock "$backend")"
 }
 
-# Cleanup runs on EVERY exit. Defers to session_leave which handles
-# refcount-based teardown of the shared proxy + /etc/hosts.
+# Cleanup runs on EVERY exit.
 cleanup_on_exit() {
-    session_leave
+    if [[ -n "$JOINED_BACKEND" ]]; then
+        backend_session_leave "$JOINED_BACKEND"
+        JOINED_BACKEND=""
+    fi
+    if [[ -n "$TMP_HOSTS_FILE" && -f "$TMP_HOSTS_FILE" ]]; then
+        rm -f "$TMP_HOSTS_FILE"
+        TMP_HOSTS_FILE=""
+    fi
 }
 trap cleanup_on_exit EXIT INT TERM
 
@@ -217,13 +237,16 @@ do_setup() {
     echo "  deepantigravity — one-time setup"
     echo "  ================================="
     echo "  This installs (sudo password required ONCE):"
-    echo "    1. /usr/local/bin/deepantigravity-helper       (root-owned helper)"
-    echo "    2. /etc/sudoers.d/deepantigravity              (NOPASSWD for $user → helper)"
-    echo "    3. CAP_NET_BIND_SERVICE on $node_bin"
+    echo "    1. bubblewrap (bwrap) — for per-session /etc/hosts isolation"
+    echo "    2. CAP_NET_BIND_SERVICE on $node_bin"
     echo ""
-    echo "  After this, day-to-day use does NOT need sudo. The /etc/hosts"
-    echo "  entries are added on each \`deepantigravity\` launch and removed"
-    echo "  on exit, so plain \`agy\` always works."
+    echo "  After this, day-to-day use does NOT need sudo. Each terminal"
+    echo "  runs agy inside a bwrap mount-ns, so multiple terminals can"
+    echo "  use different backends in parallel."
+    echo ""
+    echo "  (For backward compat, the legacy /etc/hosts helper + sudoers"
+    echo "   rule are also installed. They are no longer used by the"
+    echo "   launch path, only by --teardown for cleanup.)"
     echo ""
 
     # Generate CA + install npm deps before sudo, so the rest is cleaner
@@ -239,6 +262,21 @@ do_setup() {
 
     echo "  Authenticating with sudo..."
     sudo -v
+
+    # 0. Install bwrap if missing (apt-based distros)
+    if ! command -v bwrap >/dev/null 2>&1; then
+        if command -v apt >/dev/null 2>&1; then
+            echo "  Installing bubblewrap (apt)..."
+            sudo apt install -y bubblewrap || {
+                echo "ERROR: failed to install bubblewrap." >&2
+                exit 1
+            }
+        else
+            echo "ERROR: bwrap not installed and apt not available." >&2
+            echo "  Install bubblewrap with your distro's package manager, then re-run --setup." >&2
+            exit 1
+        fi
+    fi
 
     # 1. Install helper with root ownership
     echo "  Installing helper..."
@@ -280,14 +318,31 @@ do_teardown() {
     echo "  deepantigravity — teardown"
     echo "  =========================="
 
-    # Remove any leftover /etc/hosts entries
+    # Kill any running per-backend proxies
+    if [[ -d "$SESSIONS_ROOT" ]]; then
+        echo "  Stopping any running backend proxies..."
+        for backend in $(backend_active_list); do
+            local pid_file; pid_file="$(backend_pid_file "$backend")"
+            if [[ -f "$pid_file" ]]; then
+                local ppid; ppid="$(cat "$pid_file" 2>/dev/null || true)"
+                if [[ -n "$ppid" ]] && kill -0 "$ppid" 2>/dev/null; then
+                    echo "    killing $backend proxy (PID $ppid)"
+                    kill -9 "$ppid" 2>/dev/null || true
+                fi
+            fi
+        done
+        rm -rf "$SESSIONS_ROOT"
+        echo "  ✓ Backend proxies stopped, sessions cleaned"
+    fi
+
+    # Remove any leftover /etc/hosts entries (legacy from previous version)
     if hosts_present; then
         if helper_installed; then
-            echo "  Removing /etc/hosts entries..."
+            echo "  Removing legacy /etc/hosts entries..."
             sudo -n "$HELPER_INSTALLED" remove 2>/dev/null \
                 || sudo "$HELPER_INSTALLED" remove
         else
-            echo "  Removing /etc/hosts entries (sudo password required)..."
+            echo "  Removing legacy /etc/hosts entries (sudo password required)..."
             sudo sed -i.deepantigravity-bak \
                 '/^# >>> deepantigravity BEGIN <<<$/,/^# >>> deepantigravity END <<<$/d' \
                 /etc/hosts
@@ -332,35 +387,29 @@ show_status() {
     echo "  node:                  $(command -v node 2>/dev/null || echo 'NOT FOUND')"
     echo ""
     echo "  Setup state:"
-    echo "    Helper installed:    $(helper_installed && echo "✓ $HELPER_INSTALLED" || echo "✗ missing (run --setup)")"
-    echo "    Sudoers rule:        $(sudoers_installed && echo "✓ $SUDOERS_FILE" || echo "✗ missing (run --setup)")"
+    echo "    bwrap (bubblewrap):  $(command -v bwrap >/dev/null 2>&1 && echo "✓ $(command -v bwrap)" || echo "✗ missing (run --setup or install: sudo apt install bubblewrap)")"
     echo "    node bind cap:       $(node_has_bind_cap && echo "✓ CAP_NET_BIND_SERVICE on $node_bin" || echo "✗ missing (run --setup)")"
     echo "    CA cert:             $([[ -f "$SCRIPT_DIR/proxy/.cache/ca.pem" ]] && echo "✓ $SCRIPT_DIR/proxy/.cache/ca.pem" || echo "✗ not yet generated")"
+    echo "    Helper (legacy):     $(helper_installed && echo "$HELPER_INSTALLED (no longer required)" || echo "not installed (correct — not needed)")"
     echo ""
     echo "  Live state:"
-    echo "    /etc/hosts entries:  $(hosts_present && echo "PRESENT" || echo "absent (correct — agy alone uses real Google)")"
-    # Show shared session if any
-    if [[ -d "$SESSION_DIR" ]] && [[ -f "$SESSION_PROXY_PID" ]]; then
-        local lpid lbe
-        lpid=$(cat "$SESSION_PROXY_PID" 2>/dev/null || true)
-        lbe=$(cat "$SESSION_BACKEND" 2>/dev/null || true)
-        if [[ -n "$lpid" ]] && kill -0 "$lpid" 2>/dev/null; then
-            local n_active=0
-            if [[ -d "$SESSION_MEMBERS" ]]; then
-                for f in "$SESSION_MEMBERS"/*; do
-                    [[ -e "$f" ]] || continue
-                    local mpid; mpid="$(basename "$f")"
-                    kill -0 "$mpid" 2>/dev/null && n_active=$((n_active + 1))
-                done
+    echo "    /etc/hosts:          $(hosts_present && echo "STALE (run --teardown — new design uses bwrap, not /etc/hosts)" || echo "clean (correct — new design uses bwrap)")"
+    # Per-backend proxies
+    local found_any=0
+    if [[ -d "$SESSIONS_ROOT" ]]; then
+        for backend in $(backend_active_list); do
+            local pid_file; pid_file="$(backend_pid_file "$backend")"
+            local bip; bip="$(backend_ip "$backend")"
+            local ppid=""
+            [[ -f "$pid_file" ]] && ppid="$(cat "$pid_file" 2>/dev/null || true)"
+            if [[ -n "$ppid" ]] && kill -0 "$ppid" 2>/dev/null; then
+                local n; n="$(backend_active_count "$backend")"
+                echo "    Proxy [$backend]:        PID $ppid on $bip:$DEEPANTIGRAVITY_PORT  ($n session(s))"
+                found_any=1
             fi
-            echo "    Shared proxy:        PID $lpid (backend: ${lbe:-unknown})"
-            echo "    Active sessions:     $n_active"
-        else
-            echo "    Shared proxy:        none (state is stale, will be cleaned on next launch)"
-        fi
-    else
-        echo "    Shared proxy:        none"
+        done
     fi
+    [[ $found_any -eq 0 ]] && echo "    Active proxies:      none"
     echo ""
     echo "  Keys:"
     echo "    KIMI_API_KEY:        $(mask_key "${KIMI_API_KEY:-}")"
@@ -482,169 +531,135 @@ ensure_node_modules() {
 
 free_port() {
     local port="$1"
+    local ip="${2:-}"   # Optional: only kill listeners on this specific IP
     local stale_pid=""
+
+    # When ip is given, scope ss's match to that IP:port. Otherwise match any.
+    local ss_filter="sport = :$port"
+    [[ -n "$ip" ]] && ss_filter="$ss_filter and src = $ip"
+
     if command -v ss >/dev/null 2>&1; then
-        stale_pid=$(ss -tlnp "sport = :$port" 2>/dev/null \
+        stale_pid=$(ss -tlnp "$ss_filter" 2>/dev/null \
             | awk -F'pid=' '/LISTEN/{split($2,a,","); print a[1]}' | head -1)
     fi
     if [[ -z "$stale_pid" ]] && command -v lsof >/dev/null 2>&1; then
-        stale_pid=$(timeout 3 lsof -ti tcp:"$port" -s TCP:LISTEN 2>/dev/null || true)
+        if [[ -n "$ip" ]]; then
+            stale_pid=$(timeout 3 lsof -ti "tcp@$ip:$port" -s TCP:LISTEN 2>/dev/null || true)
+        else
+            stale_pid=$(timeout 3 lsof -ti tcp:"$port" -s TCP:LISTEN 2>/dev/null || true)
+        fi
     fi
     if [[ -n "$stale_pid" ]]; then
         kill -9 "$stale_pid" 2>/dev/null || true
     fi
 
-    # Strongest fallback: fuser -k. Sends SIGKILL to any process holding
-    # the TCP port, regardless of whether ss/lsof saw the PID. This catches
-    # orphaned daemons that were detached from the original launcher.
-    if command -v fuser >/dev/null 2>&1; then
+    # fuser fallback. Without an IP we can't scope it, so we fall back to
+    # killing anything on $port (only safe if no other backend uses $port).
+    if [[ -z "$ip" ]] && command -v fuser >/dev/null 2>&1; then
         fuser -k -SIGKILL "$port"/tcp 2>/dev/null || true
     fi
 
-    # Wait until the kernel has actually released the port.
-    if ss -tln "sport = :$port" 2>/dev/null | grep -q LISTEN; then
-        local n=0
-        while [[ $n -lt 30 ]]; do
-            if ! ss -tln "sport = :$port" 2>/dev/null | grep -q LISTEN; then break; fi
-            sleep 0.1
-            n=$((n + 1))
-        done
-    fi
+    # Wait for kernel to actually release the port (on this IP).
+    local n=0
+    while [[ $n -lt 30 ]]; do
+        if ! ss -tln "$ss_filter" 2>/dev/null | grep -q LISTEN; then break; fi
+        sleep 0.1
+        n=$((n + 1))
+    done
 }
 
 # ────────────────────────────────────────────────────────────────
 # Main launch path
 # ────────────────────────────────────────────────────────────────
 launch_agy() {
-    # Pre-flight: setup must have been done
-    if ! helper_installed || ! sudoers_installed; then
-        echo "ERROR: setup not complete. Run:" >&2
-        echo "  $0 --setup" >&2
+    # Pre-flight
+    if ! node_has_bind_cap; then
+        echo "ERROR: node lacks CAP_NET_BIND_SERVICE. Run: $0 --setup" >&2
         exit 1
     fi
-    if ! node_has_bind_cap && [[ "$DEEPANTIGRAVITY_PORT" -lt 1024 ]]; then
-        echo "ERROR: node lacks CAP_NET_BIND_SERVICE for port $DEEPANTIGRAVITY_PORT. Run:" >&2
-        echo "  $0 --setup" >&2
+    if ! command -v bwrap >/dev/null 2>&1; then
+        echo "ERROR: bwrap (bubblewrap) is not installed. Install with:" >&2
+        echo "  sudo apt install -y bubblewrap" >&2
+        echo "" >&2
+        echo "  bwrap is needed to give each terminal its own /etc/hosts so" >&2
+        echo "  different terminals can use different backends in parallel." >&2
         exit 1
     fi
 
     ensure_node_modules
-    mkdir -p "$SESSION_DIR" "$SESSION_MEMBERS"
+    mkdir -p "$SESSIONS_ROOT"
 
-    # ── Atomic critical section: join existing session OR start a new one ──
-    # flock serialises concurrent launches. Inside, we either:
-    #   (a) JOIN: existing proxy alive + same backend → just register
-    #   (b) REFUSE: existing proxy alive + different backend
-    #   (c) START: no live proxy → spawn detached daemon, write session state
+    local backend="$RESOLVED_BACKEND"
+    local ip; ip="$(backend_ip "$backend")"
+    local bdir; bdir="$(backend_dir "$backend")"
+    local pid_file; pid_file="$(backend_pid_file "$backend")"
+    local log_file; log_file="$(backend_log_file "$backend")"
+    local mdir; mdir="$(backend_members "$backend")"
+    local lock_file; lock_file="$(backend_lock "$backend")"
+
+    mkdir -p "$bdir" "$mdir"
+
+    # Warn on stale GLOBAL /etc/hosts entries from an older single-session
+    # version. The new design never touches /etc/hosts, so any leftovers
+    # break DNS for cloudcode-pa.googleapis.com globally. Try the helper
+    # if installed; otherwise tell the user to run --teardown.
+    if hosts_present; then
+        if helper_installed && sudoers_installed; then
+            echo "  Cleaning stale global /etc/hosts entries from a previous version..."
+            sudo -n "$HELPER_INSTALLED" remove 2>/dev/null || \
+                echo "  WARNING: helper-remove failed; run: $0 --teardown" >&2
+            sleep 0.1
+        else
+            echo "  WARNING: stale /etc/hosts entries found and helper not installed." >&2
+            echo "           Manually remove the deepantigravity block from /etc/hosts." >&2
+        fi
+    fi
+
+    # ── Atomic per-backend critical section: join existing or start ──
     {
         if ! flock -w 10 9; then
-            echo "ERROR: could not acquire session lock within 10s — another launcher may be hung." >&2
+            echo "ERROR: could not acquire $backend session lock within 10s." >&2
             exit 1
         fi
 
-        local existing_pid="" existing_backend=""
-        [[ -f "$SESSION_PROXY_PID" ]] && existing_pid=$(cat "$SESSION_PROXY_PID" 2>/dev/null || true)
-        [[ -f "$SESSION_BACKEND" ]]   && existing_backend=$(cat "$SESSION_BACKEND" 2>/dev/null || true)
+        local existing_pid=""
+        [[ -f "$pid_file" ]] && existing_pid="$(cat "$pid_file" 2>/dev/null || true)"
 
         if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
-            # ── (a) or (b): a proxy is already running ──
-            if [[ "$existing_backend" == "$RESOLVED_BACKEND" ]]; then
-                # JOIN
-                if [[ ! -f "$SESSION_BUNDLE" ]]; then
-                    echo "ERROR: session is corrupted (proxy alive but ca-bundle missing)." >&2
-                    echo "  Stop the running session and try again." >&2
-                    exit 1
-                fi
-                touch "$SESSION_MEMBERS/$$"
-                JOINED_SESSION=1
-                local n_active; n_active=$(session_active_member_count)
-                echo "  Joined shared session: backend=$existing_backend, proxy PID=$existing_pid ($n_active session(s) active)"
-                export SSL_CERT_FILE="$SESSION_BUNDLE"
-                export SSL_CERT_DIR="$(dirname "$SESSION_BUNDLE")"
-            else
-                # REFUSE
-                local n_active; n_active=$(session_active_member_count)
-                echo "ERROR: another deepantigravity session is running with a DIFFERENT backend" >&2
-                echo "  Running backend: $existing_backend  (proxy PID $existing_pid, $n_active session(s) active)" >&2
-                echo "  Requested:       $RESOLVED_BACKEND" >&2
-                echo "" >&2
-                echo "  All concurrent sessions on this machine must use the same backend" >&2
-                echo "  (only one process can bind 127.0.0.1:443 and there's only one" >&2
-                echo "  /etc/hosts redirect target)." >&2
-                echo "" >&2
-                echo "  Either re-run with -b $existing_backend, or stop the other sessions." >&2
-                exit 1
-            fi
+            # JOIN existing backend session
+            touch "$mdir/$$"
+            JOINED_BACKEND="$backend"
+            local n; n="$(backend_active_count "$backend")"
+            echo "  Joined $backend session: proxy PID $existing_pid on $ip:$DEEPANTIGRAVITY_PORT ($n session(s) active)"
         else
-            # ── (c): no live proxy — start fresh ──
-            # Clean stale session state (proxy was killed, members are dead)
-            rm -f "$SESSION_PROXY_PID" "$SESSION_BACKEND" "$SESSION_BUNDLE" "$SESSION_LOG"
-            rm -rf "$SESSION_MEMBERS"
-            mkdir -p "$SESSION_MEMBERS"
+            # START fresh: spawn this backend's proxy
+            rm -f "$pid_file" "$log_file"
+            free_port "$DEEPANTIGRAVITY_PORT" "$ip"
 
-            # Clean stale /etc/hosts (from a crashed previous session)
-            if hosts_present; then
-                echo "  Detected stale /etc/hosts entries — cleaning..."
-                if ! sudo -n "$HELPER_INSTALLED" remove 2>/dev/null; then
-                    echo "ERROR: passwordless sudo for the helper failed. Run --teardown then --setup." >&2
-                    exit 1
-                fi
-                sleep 0.1
-            fi
+            : > "$log_file"
+            echo "  Starting $backend proxy on $ip:$DEEPANTIGRAVITY_PORT ..."
 
-            # Resolve real Google IPs BEFORE hijacking /etc/hosts.
-            # systemd-resolved serves /etc/hosts even on direct DNS queries.
-            local cloudcode_ip="" daily_ip=""
-            cloudcode_ip=$(getent ahostsv4 cloudcode-pa.googleapis.com 2>/dev/null | awk 'NR==1{print $1}')
-            daily_ip=$(getent ahostsv4 daily-cloudcode-pa.googleapis.com 2>/dev/null | awk 'NR==1{print $1}')
-            if [[ -z "$cloudcode_ip" || "$cloudcode_ip" == "127.0.0.1" ]]; then
-                echo "ERROR: could not resolve real IP of cloudcode-pa.googleapis.com (got: '$cloudcode_ip')" >&2
-                exit 1
-            fi
-            [[ -z "$daily_ip" || "$daily_ip" == "127.0.0.1" ]] && daily_ip="$cloudcode_ip"
-            echo "  Real IPs: cloudcode-pa → $cloudcode_ip, daily-cloudcode-pa → $daily_ip"
-
-            echo "  Adding /etc/hosts redirect for cloudcode-pa.googleapis.com..."
-            if ! sudo -n "$HELPER_INSTALLED" add 2>/dev/null; then
-                echo "ERROR: passwordless sudo for the helper failed. Run --setup again." >&2
-                exit 1
-            fi
-
-            free_port "$DEEPANTIGRAVITY_PORT"
-
-            # Spawn proxy DETACHED (nohup + setsid) so it survives this
-            # leader's exit. The proxy writes port + CA path on stdout
-            # within ~1s, then keeps running.
-            : > "$SESSION_LOG"
-            echo "  Starting deepantigravity TLS server → $RESOLVED_BACKEND ..."
-
-            local nohup_or_setsid="setsid"
-            command -v setsid >/dev/null 2>&1 || nohup_or_setsid="nohup"
-            # IMPORTANT: 9<&- closes FD 9 in the spawned proxy. Otherwise
-            # the proxy inherits the launcher's flock-holder FD and the
-            # lock stays held FOR THE ENTIRE LIFE OF THE PROXY (because
-            # flock is released only when ALL FDs on the open file
-            # description close). Subsequent launchers would deadlock on
-            # `flock 9` until the proxy itself died.
-            $nohup_or_setsid env \
-                DEEPANTIGRAVITY_REAL_IP_CLOUDCODE="$cloudcode_ip" \
-                DEEPANTIGRAVITY_REAL_IP_DAILY="$daily_ip" \
+            local launcher_cmd="setsid"
+            command -v setsid >/dev/null 2>&1 || launcher_cmd="nohup"
+            # 9<&- closes FD 9 in the spawned proxy so the lock isn't
+            # held by the proxy's inherited FD for its whole lifetime.
+            $launcher_cmd env \
                 ${DEEPANTIGRAVITY_DEBUG:+DEEPANTIGRAVITY_DEBUG="$DEEPANTIGRAVITY_DEBUG"} \
-                node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_BACKEND" "$DEEPANTIGRAVITY_PORT" \
-                > "$SESSION_LOG" 2>&1 < /dev/null 9<&- &
+                node "$SCRIPT_DIR/proxy/start-proxy.js" \
+                    "$backend" "$DEEPANTIGRAVITY_PORT" "$ip" \
+                > "$log_file" 2>&1 < /dev/null 9<&- &
             local proxy_pid=$!
             disown 2>/dev/null || true
 
-            # Wait for "port-number\nca-path" lines to appear on stdout.
+            # Wait for the "port\nca-path" lines.
             local tries=0
             while [[ $tries -lt 60 ]]; do
-                if [[ -s "$SESSION_LOG" ]] && grep -q '^[0-9]\+$' "$SESSION_LOG" 2>/dev/null; then
+                if [[ -s "$log_file" ]] && grep -q '^[0-9]\+$' "$log_file" 2>/dev/null; then
                     break
                 fi
                 if ! kill -0 "$proxy_pid" 2>/dev/null; then
-                    echo "ERROR: proxy died on startup. Last log lines:" >&2
-                    tail -20 "$SESSION_LOG" >&2 2>/dev/null || true
-                    sudo -n "$HELPER_INSTALLED" remove 2>/dev/null || true
+                    echo "ERROR: $backend proxy died on startup. Log:" >&2
+                    tail -20 "$log_file" >&2 2>/dev/null || true
                     exit 1
                 fi
                 sleep 0.1
@@ -652,51 +667,66 @@ launch_agy() {
             done
 
             local proxy_port ca_path
-            proxy_port=$(grep -m1 '^[0-9]\+$' "$SESSION_LOG" || true)
-            ca_path=$(grep -m1 '^/' "$SESSION_LOG" || true)
-            if [[ -z "$proxy_port" ]] || [[ -z "$ca_path" ]] || [[ ! -f "$ca_path" ]]; then
-                echo "ERROR: proxy startup output unexpected. Log:" >&2
-                tail -20 "$SESSION_LOG" >&2 2>/dev/null || true
+            proxy_port="$(grep -m1 '^[0-9]\+$' "$log_file" || true)"
+            ca_path="$(grep -m1 '^/' "$log_file" || true)"
+            if [[ -z "$proxy_port" || -z "$ca_path" || ! -f "$ca_path" ]]; then
+                echo "ERROR: $backend proxy startup output unexpected. Log:" >&2
+                tail -20 "$log_file" >&2 2>/dev/null || true
                 kill -9 "$proxy_pid" 2>/dev/null || true
-                sudo -n "$HELPER_INSTALLED" remove 2>/dev/null || true
                 exit 1
             fi
 
-            # Build combined CA bundle (our local CA + system roots) so
-            # non-cloudcode-pa TLS still validates.
-            local system_ca=""
-            for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt \
-                     /etc/ssl/cert.pem /etc/ssl/ca-bundle.pem; do
-                if [[ -f "$f" ]]; then system_ca="$f"; break; fi
-            done
-            if [[ -n "$system_ca" ]]; then
-                cat "$ca_path" "$system_ca" > "$SESSION_BUNDLE"
-            else
-                cp "$ca_path" "$SESSION_BUNDLE"
-                echo "  WARNING: system CA bundle not found; non-Google TLS may fail" >&2
-            fi
-
-            # Record session state and register self as first member
-            echo "$proxy_pid" > "$SESSION_PROXY_PID"
-            echo "$RESOLVED_BACKEND" > "$SESSION_BACKEND"
-            touch "$SESSION_MEMBERS/$$"
-            JOINED_SESSION=1
-
-            echo "  TLS server on 127.0.0.1:$proxy_port  → $RESOLVED_BACKEND  (proxy PID $proxy_pid)"
-            echo "  CA bundle: $SESSION_BUNDLE"
-
-            export SSL_CERT_FILE="$SESSION_BUNDLE"
-            export SSL_CERT_DIR="$(dirname "$SESSION_BUNDLE")"
+            echo "$proxy_pid" > "$pid_file"
+            touch "$mdir/$$"
+            JOINED_BACKEND="$backend"
+            echo "  TLS server on $ip:$proxy_port → $backend (proxy PID $proxy_pid)"
         fi
-    } 9>"$SESSION_LOCK"
+    } 9>"$lock_file"
+
+    # Build combined CA bundle (our local CA + system roots). Same CA
+    # is used by all backend proxies (they share proxy/.cache/ca.pem).
+    local our_ca="$SCRIPT_DIR/proxy/.cache/ca.pem"
+    local system_ca=""
+    for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt \
+             /etc/ssl/cert.pem /etc/ssl/ca-bundle.pem; do
+        if [[ -f "$f" ]]; then system_ca="$f"; break; fi
+    done
+    if [[ -n "$system_ca" ]]; then
+        cat "$our_ca" "$system_ca" > "$CA_BUNDLE_PATH"
+    else
+        cp "$our_ca" "$CA_BUNDLE_PATH"
+        echo "  WARNING: system CA bundle not found; non-Google TLS may fail" >&2
+    fi
+
+    # Per-session /etc/hosts: original entries minus any deepantigravity
+    # block, plus a fresh redirect to THIS backend's IP. bwrap will
+    # bind-mount this over /etc/hosts only inside agy's namespace, so
+    # other terminals (and the host) are unaffected.
+    TMP_HOSTS_FILE="$(mktemp /tmp/deepantigravity-hosts-XXXXXX)"
+    {
+        sed '/# >>> deepantigravity BEGIN <<</,/# <<< deepantigravity END <<</d' /etc/hosts
+        echo ""
+        echo "# >>> deepantigravity BEGIN <<<  (per-session, bwrap-mounted)"
+        echo "$ip cloudcode-pa.googleapis.com"
+        echo "$ip daily-cloudcode-pa.googleapis.com"
+        echo "# <<< deepantigravity END <<<"
+    } > "$TMP_HOSTS_FILE"
 
     echo ""
 
-    # Run agy in foreground. Trap fires session_leave on exit, which
-    # decrements refcount and tears down the proxy + /etc/hosts only
-    # if we were the last active session.
+    # Run agy inside bwrap with our custom /etc/hosts. Network is shared
+    # with the host (no --unshare-net), so agy can still reach our proxy
+    # at $ip:443 over loopback. /proc and /dev are fresh mounts.
     set +e
-    agy "${PASS_ARGS[@]}"
+    bwrap \
+        --bind / / \
+        --proc /proc \
+        --dev /dev \
+        --bind "$TMP_HOSTS_FILE" /etc/hosts \
+        --setenv SSL_CERT_FILE "$CA_BUNDLE_PATH" \
+        --setenv SSL_CERT_DIR "$(dirname "$CA_BUNDLE_PATH")" \
+        --die-with-parent \
+        agy "${PASS_ARGS[@]}"
     local agy_status=$?
     set -e
     return $agy_status
