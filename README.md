@@ -53,6 +53,7 @@ cd proxy && npm install && cd ..
 
 cp proxy/.env.example proxy/.env
 nano proxy/.env       # add your KIMI_API_KEY and/or NVIDIA_API_KEY
+chmod +x deepantigravity.sh
 ```
 
 ### 3. One-time setup
