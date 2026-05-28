@@ -150,7 +150,12 @@ session_leave() {
     [[ "$JOINED_SESSION" -eq 1 ]] || return 0
     [[ -d "$SESSION_DIR" ]] || return 0
     {
-        flock 9
+        if ! flock -w 5 9; then
+            # Best-effort: at least drop our member file even without
+            # the lock, so we don't pollute the refcount forever.
+            rm -f "$SESSION_MEMBERS/$$" 2>/dev/null || true
+            return 0
+        fi
         rm -f "$SESSION_MEMBERS/$$"
         local active; active=$(session_active_member_count)
         if [[ "$active" -gt 0 ]]; then
@@ -485,12 +490,15 @@ free_port() {
     if [[ -z "$stale_pid" ]] && command -v lsof >/dev/null 2>&1; then
         stale_pid=$(timeout 3 lsof -ti tcp:"$port" -s TCP:LISTEN 2>/dev/null || true)
     fi
-    if [[ -z "$stale_pid" ]] && command -v fuser >/dev/null 2>&1; then
-        stale_pid=$(fuser -n tcp "$port" 2>/dev/null | tr -s ' ' | tr ' ' '\n' \
-                    | awk 'NR==1' || true)
-    fi
     if [[ -n "$stale_pid" ]]; then
         kill -9 "$stale_pid" 2>/dev/null || true
+    fi
+
+    # Strongest fallback: fuser -k. Sends SIGKILL to any process holding
+    # the TCP port, regardless of whether ss/lsof saw the PID. This catches
+    # orphaned daemons that were detached from the original launcher.
+    if command -v fuser >/dev/null 2>&1; then
+        fuser -k -SIGKILL "$port"/tcp 2>/dev/null || true
     fi
 
     # Wait until the kernel has actually released the port.
@@ -529,7 +537,10 @@ launch_agy() {
     #   (b) REFUSE: existing proxy alive + different backend
     #   (c) START: no live proxy → spawn detached daemon, write session state
     {
-        flock 9
+        if ! flock -w 10 9; then
+            echo "ERROR: could not acquire session lock within 10s — another launcher may be hung." >&2
+            exit 1
+        fi
 
         local existing_pid="" existing_backend=""
         [[ -f "$SESSION_PROXY_PID" ]] && existing_pid=$(cat "$SESSION_PROXY_PID" 2>/dev/null || true)
@@ -607,12 +618,20 @@ launch_agy() {
             : > "$SESSION_LOG"
             echo "  Starting deepantigravity TLS server → $RESOLVED_BACKEND ..."
 
-            nohup setsid env \
+            local nohup_or_setsid="setsid"
+            command -v setsid >/dev/null 2>&1 || nohup_or_setsid="nohup"
+            # IMPORTANT: 9<&- closes FD 9 in the spawned proxy. Otherwise
+            # the proxy inherits the launcher's flock-holder FD and the
+            # lock stays held FOR THE ENTIRE LIFE OF THE PROXY (because
+            # flock is released only when ALL FDs on the open file
+            # description close). Subsequent launchers would deadlock on
+            # `flock 9` until the proxy itself died.
+            $nohup_or_setsid env \
                 DEEPANTIGRAVITY_REAL_IP_CLOUDCODE="$cloudcode_ip" \
                 DEEPANTIGRAVITY_REAL_IP_DAILY="$daily_ip" \
                 ${DEEPANTIGRAVITY_DEBUG:+DEEPANTIGRAVITY_DEBUG="$DEEPANTIGRAVITY_DEBUG"} \
                 node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_BACKEND" "$DEEPANTIGRAVITY_PORT" \
-                > "$SESSION_LOG" 2>&1 < /dev/null &
+                > "$SESSION_LOG" 2>&1 < /dev/null 9<&- &
             local proxy_pid=$!
             disown 2>/dev/null || true
 

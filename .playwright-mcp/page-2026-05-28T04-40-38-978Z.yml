@@ -1,0 +1,244 @@
+- main "Call for Volunteers of Cambodia ICT Camp 2026" [ref=e12]:
+  - generic [ref=e14]:
+    - generic [ref=e15]:
+      - generic [ref=e16]:
+        - button "English (United States)‎" [ref=e18] [cursor=pointer]:
+          - img [ref=e20]
+          - generic [ref=e22]: English (United States)‎
+          - img [ref=e24]
+        - button "Form Menu" [ref=e29] [cursor=pointer]:
+          - img [ref=e31]
+      - heading "Call for Volunteers of Cambodia ICT Camp 2026" [level=1] [ref=e35]
+    - generic [ref=e37]:
+      - generic [ref=e38]: The Cambodia ICT Camp 2026 will convene on 19-20 September 2026 in Siem Reap province
+      - text: following its regular two-year cycle! Similar to its previous editions, this dynamic and participatory camp will provide a collaborative platform for both the speakers and participants to meet, share, and reflect the digital future of Cambodia and Mekong region.
+      - text: The Camp will be attended by diverse participants, working in the fields of open data, media and journalism, artificial intelligence (AI), online safety, digital rights, and research and advocacy. They will have the opportunity to engage in an in-depth learning provided by the national and international experts and get to experience the real-life applications of technologies while connecting with like-minded community.
+      - generic [ref=e39]: The organizing committee is opening the opportunity for 5-10 Cambodian students or youths to join us as the volunteers and become part of the organizing committee for the Cambodia ICT Camp 2026. With closed guidance from the organizing committee, the volunteers will assist with facilitating national and international speakers, providing logistical and media supports, and contributing to blog post and camp report.
+      - generic [ref=e40]: "To be eligible for the volunteers of this camp, applicants must meet the criteria as following:"
+      - list [ref=e41]:
+        - listitem [ref=e42]:
+          - generic [ref=e43]: Be Cambodian university students or youths with educational backgrounds in media, communications, data science, tourism, hospitality, ICT, AI, or other related fields.
+        - listitem [ref=e44]: Currently seeking volunteering opportunity to develop skills and gain hands-on experience relevant to their educational background.
+        - listitem [ref=e45]: Demonstrate strong support for the objectives and values of the Camp.
+        - listitem [ref=e46]: Committed to fulfilling assigned tasks throughout the Camp as a team and in collaboration with the organizing committee.
+        - listitem [ref=e47]: Be able to perform the volunteering role for a period of three months from July 2026 - September 2026.
+        - listitem [ref=e48]: Be able to participate fully in orientation session on the Camp, knowledge-sharing sessions, preparation meetings, and the event day.
+        - listitem [ref=e49]: Be able to communicate in English.
+        - listitem [ref=e50]: Have access to a personal computer.
+      - text: Volunteers will receive a certificate of recognition and small incentive in appreciation for their commitment and contribution in the Camp, in addition to gaining skill development, hands-on experiences, and networking opportunities throughout the camp.
+      - text: Please do not miss this valuable opportunity if you meet the selection criteria! The application deadline is Monday, 15 June 2026 at 23:59 (Indochina time). Only shortlisted candidates will be contacted for a group interview.
+      - text: "Privacy Notice: all information will be treated confidentially and used solely for selection purposes."
+      - text: "Should you have any questions, please reach out to the Secretariat Team via this email:"
+      - link "event@cambodiaict.net" [ref=e52] [cursor=pointer]:
+        - /url: mailto:event@cambodiaict.net
+  - generic [ref=e53]:
+    - generic [ref=e54]:
+      - generic [ref=e55]: When you submit this form, it will not automatically collect your details like name and email address unless you provide it yourself.
+      - generic [ref=e56]:
+        - generic [ref=e57]: "*"
+        - text: Required
+    - 'region "Section 1: Personal Information Page 1 of 3" [ref=e58]':
+      - 'generic "Section 1: Personal Information" [ref=e60]':
+        - 'heading "Section 1: Personal Information" [level=2] [ref=e63]':
+          - generic [ref=e64]: "Section 1: Personal Information"
+      - generic [ref=e65]:
+        - generic [ref=e68]:
+          - heading "1. Full name (Surname and first name) Required to answer" [level=2] [ref=e69]:
+            - generic [ref=e70]: "1."
+            - generic [ref=e72]: Full name (Surname and first name)
+            - note "Required to answer" [ref=e73]: "*"
+          - log [ref=e74]
+        - textbox "1. Full name (Surname and first name) Required to answer" [active] [ref=e78]:
+          - /placeholder: Enter your answer
+      - generic [ref=e79]:
+        - generic [ref=e82]:
+          - heading "2. GenderRequired to answer" [level=2] [ref=e83]:
+            - generic [ref=e84]: "2."
+            - text: Gender
+            - note "Required to answer" [ref=e85]: "*"
+          - log [ref=e86]
+        - radiogroup "2. GenderRequired to answer" [ref=e88]:
+          - generic [ref=e89]:
+            - generic [ref=e92]:
+              - generic [ref=e93]:
+                - radio "Woman" [ref=e94] [cursor=pointer]
+                - img [ref=e96]
+              - generic "Woman" [ref=e98]
+            - generic [ref=e101]:
+              - generic [ref=e102]:
+                - radio "Man" [ref=e103] [cursor=pointer]
+                - img [ref=e105]
+              - generic "Man" [ref=e107]
+            - generic [ref=e110]:
+              - generic [ref=e111]:
+                - radio "Non-binary" [ref=e112] [cursor=pointer]
+                - img [ref=e114]
+              - generic "Non-binary" [ref=e116]
+            - generic [ref=e119]:
+              - generic [ref=e120]:
+                - radio "Other" [ref=e121] [cursor=pointer]
+                - img [ref=e123]
+              - generic "Other" [ref=e125]
+      - generic [ref=e126]:
+        - generic [ref=e129]:
+          - heading "3. Birth yearRequired to answer" [level=2] [ref=e130]:
+            - generic [ref=e131]: "3."
+            - text: Birth year
+            - note "Required to answer" [ref=e132]: "*"
+          - log [ref=e133]
+        - textbox "3. Birth yearRequired to answer" [ref=e137]:
+          - /placeholder: Enter your answer
+      - generic [ref=e138]:
+        - generic [ref=e141]:
+          - heading "4. Email addressRequired to answer" [level=2] [ref=e142]:
+            - generic [ref=e143]: "4."
+            - text: Email address
+            - note "Required to answer" [ref=e144]: "*"
+          - log [ref=e145]
+        - textbox "4. Email addressRequired to answer" [ref=e149]:
+          - /placeholder: Enter your answer
+      - generic [ref=e150]:
+        - generic [ref=e153]:
+          - heading "5. Social identity (select those you self-identify with)Required to answer" [level=2] [ref=e154]:
+            - generic [ref=e155]: "5."
+            - generic [ref=e156]: Social identity (select those you self-identify with)
+            - note "Required to answer" [ref=e157]: "*"
+          - log [ref=e158]
+        - radiogroup "5. Social identity (select those you self-identify with)Required to answer" [ref=e160]:
+          - generic [ref=e161]:
+            - generic [ref=e164]:
+              - generic [ref=e165]:
+                - radio "LGBTIQ+ communities" [ref=e166] [cursor=pointer]
+                - img [ref=e168]
+              - generic "LGBTIQ+ communities" [ref=e170]
+            - generic [ref=e173]:
+              - generic [ref=e174]:
+                - radio "Indigenous communities" [ref=e175] [cursor=pointer]
+                - img [ref=e177]
+              - generic "Indigenous communities" [ref=e179]
+            - generic [ref=e182]:
+              - generic [ref=e183]:
+                - radio "Persons with disabilities" [ref=e184] [cursor=pointer]
+                - img [ref=e186]
+              - generic "Persons with disabilities" [ref=e188]
+            - generic [ref=e191]:
+              - generic [ref=e192]:
+                - radio "Ethnic minorities" [ref=e193] [cursor=pointer]
+                - img [ref=e195]
+              - generic "Ethnic minorities" [ref=e197]
+            - generic [ref=e200]:
+              - generic [ref=e201]:
+                - radio "Khmer" [ref=e202] [cursor=pointer]
+                - img [ref=e204]
+              - generic "Khmer" [ref=e206]
+          - generic [ref=e208]:
+            - generic [ref=e209]:
+              - radio "Other answer" [ref=e210] [cursor=pointer]
+              - img [ref=e212]
+            - textbox "Other answer" [ref=e216]:
+              - /placeholder: Other
+      - generic [ref=e217]:
+        - generic [ref=e218]:
+          - generic [ref=e220]:
+            - heading "6. Which university do you go to?Required to answer" [level=2] [ref=e221]:
+              - generic [ref=e222]: "6."
+              - generic [ref=e223]: Which university do you go to?
+              - note "Required to answer" [ref=e224]: "*"
+            - log [ref=e225]
+          - generic [ref=e229]: E.g. Cambodia Academy of Digital Technology
+        - textbox "6. Which university do you go to?Required to answer E.g. Cambodia Academy of Digital Technology" [ref=e233]:
+          - /placeholder: Enter your answer
+      - generic [ref=e234]:
+        - generic [ref=e235]:
+          - generic [ref=e237]:
+            - heading "7. What is your Bachelor’s degree?Required to answer" [level=2] [ref=e238]:
+              - generic [ref=e239]: "7."
+              - generic [ref=e242]: What is your Bachelor’s degree?
+              - note "Required to answer" [ref=e243]: "*"
+            - log [ref=e244]
+          - generic [ref=e248]: E.g. Media and Communications
+        - textbox "7. What is your Bachelor’s degree?Required to answer E.g. Media and Communications" [ref=e252]:
+          - /placeholder: Enter your answer
+      - generic [ref=e253]:
+        - generic [ref=e254]:
+          - generic [ref=e256]:
+            - heading "8. Which year are you currently in?Required to answer" [level=2] [ref=e257]:
+              - generic [ref=e258]: "8."
+              - generic [ref=e262]: Which year are you currently in?
+              - note "Required to answer" [ref=e263]: "*"
+            - log [ref=e264]
+          - generic [ref=e269]: E.g. Fourth year
+        - textbox "8. Which year are you currently in?Required to answer E.g. Fourth year" [ref=e273]:
+          - /placeholder: Enter your answer
+      - generic [ref=e274]:
+        - generic [ref=e277]:
+          - heading "9. Do you have a personal computer?Required to answer" [level=2] [ref=e278]:
+            - generic [ref=e279]: "9."
+            - generic [ref=e280]: Do you have a personal computer?
+            - note "Required to answer" [ref=e281]: "*"
+          - log [ref=e282]
+        - radiogroup "9. Do you have a personal computer?Required to answer" [ref=e284]:
+          - generic [ref=e285]:
+            - generic [ref=e288]:
+              - generic [ref=e289]:
+                - radio "Yes" [ref=e290] [cursor=pointer]
+                - img [ref=e292]
+              - generic "Yes" [ref=e294]
+            - generic [ref=e297]:
+              - generic [ref=e298]:
+                - radio "No" [ref=e299] [cursor=pointer]
+                - img [ref=e301]
+              - generic "No" [ref=e303]
+      - generic [ref=e304]:
+        - generic [ref=e307]:
+          - heading "10. English ProficiencyRequired to answer" [level=2] [ref=e308]:
+            - generic [ref=e309]: "10."
+            - generic [ref=e310]: English Proficiency
+            - note "Required to answer" [ref=e311]: "*"
+          - log [ref=e312]
+        - radiogroup "10. English ProficiencyRequired to answer" [ref=e314]:
+          - generic [ref=e315]:
+            - generic [ref=e318]:
+              - generic [ref=e319]:
+                - radio "Beginner" [ref=e320] [cursor=pointer]
+                - img [ref=e322]
+              - generic "Beginner" [ref=e324]
+            - generic [ref=e327]:
+              - generic [ref=e328]:
+                - radio "Intermediate" [ref=e329] [cursor=pointer]
+                - img [ref=e331]
+              - generic "Intermediate" [ref=e333]
+            - generic [ref=e336]:
+              - generic [ref=e337]:
+                - radio "Very good" [ref=e338] [cursor=pointer]
+                - img [ref=e340]
+              - generic "Very good" [ref=e342]
+            - generic [ref=e345]:
+              - generic [ref=e346]:
+                - radio "Excellent" [ref=e347] [cursor=pointer]
+                - img [ref=e349]
+              - generic "Excellent" [ref=e351]
+    - generic [ref=e352]:
+      - button "Next" [ref=e354] [cursor=pointer]
+      - progressbar "Page 1 of 3" [ref=e355]:
+        - generic [ref=e356]: Page 1 of 3
+    - generic [ref=e359]:
+      - text: Never give out your password.
+      - link "Report abuse" [ref=e360] [cursor=pointer]
+  - generic [ref=e361]:
+    - link "Microsoft 365" [ref=e363] [cursor=pointer]
+    - contentinfo [ref=e364]:
+      - generic [ref=e365]:
+        - generic [ref=e366]: This content is created by the owner of the form. The data you submit will be sent to the form owner. Microsoft is not responsible for the privacy or security practices of its customers, including those of this form owner. Never give out your password.
+        - generic [ref=e367]:
+          - generic [ref=e368]:
+            - link "Microsoft Forms" [ref=e369] [cursor=pointer]
+            - text: "| AI-Powered surveys, quizzes and polls"
+            - link "Create my own form" [ref=e371] [cursor=pointer]
+          - generic [ref=e372]:
+            - text: The owner of this form has not provided a privacy statement as to how they will use your response data. Do not provide personal or sensitive information. |
+            - link "Consumer Health Privacy" [ref=e374] [cursor=pointer]:
+              - /url: https://go.microsoft.com/fwlink/?linkid=2259814
+            - text: "|"
+            - link "Terms of use" [ref=e375] [cursor=pointer]:
+              - /url: https://go.microsoft.com/fwlink/?linkid=866263
