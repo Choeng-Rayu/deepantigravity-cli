@@ -1,0 +1,6 @@
+proxy/.env
+proxy/.cache/
+proxy/node_modules/
+proxy/package-lock.json
+*.log
+.DS_Store
