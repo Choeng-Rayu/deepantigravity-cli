@@ -2,6 +2,8 @@
 
 Step-by-step practical guide. For architecture details, see `README.md`.
 
+> **Note:** This guide covers Linux/macOS. For Windows, use `deepantigravity.ps1` instead.
+
 ---
 
 ## Quick start (30 seconds if already set up)
