@@ -5,7 +5,7 @@
  * Boot the deepantigravity HTTPS-MITM proxy.
  *
  * Usage:
- *   node start-proxy.js <backend> [port]
+ *   node start-proxy.js <backend> [port] [bind-ip]
  *
  * Reads the upstream URL/key/model from standard env vars (the launcher
  * exports them after sourcing proxy/.env). On success, prints two lines
@@ -44,8 +44,8 @@ function die(msg) {
     process.exit(1);
 }
 
-const [backendArg, portArg] = process.argv.slice(2);
-if (!backendArg) die('usage: node start-proxy.js <backend> [port]');
+const [backendArg, portArg, bindIpArg] = process.argv.slice(2);
+if (!backendArg) die('usage: node start-proxy.js <backend> [port] [bind-ip]');
 
 const backend = canonicalize(backendArg);
 const def = BACKEND_DEFS[backend];
@@ -60,10 +60,12 @@ if (!upstreamKey) {
 }
 
 const port = parseInt(portArg || process.env.DEEPANTIGRAVITY_PORT || '443', 10);
+const bindAddr = bindIpArg || process.env.DEEPANTIGRAVITY_BIND_IP || '127.0.0.1';
 
 try {
     const { port: actualPort, caPath } = await startProxy({
         port,
+        bindAddr,
         backend,
         upstreamUrl,
         upstreamKey,
@@ -75,7 +77,7 @@ try {
     // "^[0-9]+$" grep.
     process.stdout.write(String(actualPort) + '\n');
     process.stdout.write(String(caPath) + '\n');
-    console.error(`[deepantigravity] proxy ready on :${actualPort}`);
+    console.error(`[deepantigravity] proxy ready on ${bindAddr}:${actualPort}`);
     console.error(`[deepantigravity] backend=${backend}  upstream=${upstreamUrl}  model=${targetModel}`);
     console.error(`[deepantigravity] CA: ${caPath}`);
 } catch (e) {
