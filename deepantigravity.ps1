@@ -5,11 +5,21 @@
 #   (real Google Gemini). When it IS running, `agy` is transparently
 #   routed through our local proxy to a different backend.
 #
-# KEY DIFFERENCE FROM LINUX:
-#   Windows has no setcap and no clean passwordless-sudo equivalent.
-#   So each launch DOES require Administrator (the script auto-elevates).
-#   The hosts-file edit happens at launch and is reverted on exit, so
-#   plain `agy` still works correctly when this launcher isn't running.
+# KEY DIFFERENCES FROM LINUX:
+#   * Windows has no setcap, no passwordless-sudo, and no mount namespace
+#     (bwrap) equivalent that's available unprivileged. So:
+#       - LEADER (first terminal of a backend): needs Administrator to
+#         bind :443 and to modify the Windows hosts file. Auto-elevates.
+#       - FOLLOWERS (additional terminals using the SAME backend):
+#         do NOT need Administrator. They just attach to the existing
+#         proxy and run `agy` as a regular user.
+#   * Multiple terminals with the SAME backend share one proxy
+#     (refcounted, last out tears down).
+#   * Different backends in parallel are NOT supported on Windows
+#     because there is no per-process hosts-file equivalent without
+#     WSL2 or kernel-level DNS hooks. The launcher refuses cleanly.
+#   * The proxy is launched detached so it survives the leader's exit.
+#     Followers can use it until the last terminal exits.
 
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -27,7 +37,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# ── Resolve symlinks ──
+# ── Resolve symlinks so $ScriptDir always points at the real repo ──
 $_scriptPath = $MyInvocation.MyCommand.Path
 while ($_scriptPath) {
     $_item = Get-Item -LiteralPath $_scriptPath -ErrorAction SilentlyContinue
@@ -42,7 +52,7 @@ while ($_scriptPath) {
 $ScriptDir = Split-Path -Parent $_scriptPath
 Remove-Variable _scriptPath, _item, _target -ErrorAction SilentlyContinue
 
-# ── Load .env ──
+# ── Load proxy/.env ──
 $EnvFile = Join-Path $ScriptDir 'proxy\.env'
 if (Test-Path $EnvFile) {
     Get-Content $EnvFile | ForEach-Object {
@@ -60,9 +70,9 @@ if (Test-Path $EnvFile) {
     }
 }
 
-# ── Defaults ──
+# ── Defaults & paths ──
 $DeepantigravityPort = if ($env:DEEPANTIGRAVITY_PORT) { $env:DEEPANTIGRAVITY_PORT } else { '443' }
-$DefaultBackend = if ($env:API_PROVIDER) { $env:API_PROVIDER } else { 'kimi' }
+$DefaultBackend      = if ($env:API_PROVIDER) { $env:API_PROVIDER } else { 'kimi' }
 if (-not $Backend) { $Backend = $DefaultBackend }
 
 $HostsFile          = "$env:WINDIR\System32\drivers\etc\hosts"
@@ -70,7 +80,17 @@ $HostsSentinelBegin = '# >>> deepantigravity BEGIN <<<'
 $HostsSentinelEnd   = '# >>> deepantigravity END <<<'
 $HijackedHosts      = @('cloudcode-pa.googleapis.com', 'daily-cloudcode-pa.googleapis.com')
 
-$script:HostsHijackedByUs = $false
+# Session state — mirrors deepantigravity.sh's proxy/.cache/session/.
+$SessionDir         = Join-Path $ScriptDir 'proxy\.cache\session'
+$SessionLockFile    = Join-Path $SessionDir 'lock'
+$SessionPidFile     = Join-Path $SessionDir 'proxy.pid'
+$SessionBackendFile = Join-Path $SessionDir 'backend'
+$SessionBundleFile  = Join-Path $SessionDir 'ca-bundle.pem'
+$SessionLogFile     = Join-Path $SessionDir 'proxy.log'
+$SessionMembersDir  = Join-Path $SessionDir 'members'
+$GlobalMutexName    = 'Global\deepantigravity-session'   # cross-process lock
+
+$script:JoinedSession = $false   # 1 if this PID is registered as a session member
 
 # ── Helpers ──
 function Convert-Backend([string]$name) {
@@ -88,9 +108,30 @@ function Hide-Key($v) {
 }
 
 function Test-Admin {
-    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    $p = New-Object System.Security.Principal.WindowsPrincipal($id)
-    return $p.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    # On non-Windows hosts (e.g. PowerShell Core on Linux), the
+    # WindowsPrincipal API throws. Treat that as "not admin" so the
+    # script can still display status / help without failing.
+    if ($IsLinux -or $IsMacOS) {
+        # Linux/macOS proxy of "is admin" — true iff EUID == 0.
+        try { return ((id -u 2>/dev/null) -eq '0') } catch { return $false }
+    }
+    try {
+        $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $p  = New-Object System.Security.Principal.WindowsPrincipal($id)
+        return $p.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+function Test-PidAlive([int]$proc_id) {
+    if ($proc_id -le 0) { return $false }
+    try {
+        $null = Get-Process -Id $proc_id -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 function Test-HostsHijacked {
@@ -99,25 +140,75 @@ function Test-HostsHijacked {
 }
 
 function Add-HostsHijack {
-    if (Test-HostsHijacked) {
-        $script:HostsHijackedByUs = $true   # treat stale entries as ours so we clean up
-        return
-    }
+    if (Test-HostsHijacked) { return }
     $block  = "`r`n" + $HostsSentinelBegin + "`r`n"
     foreach ($h in $HijackedHosts) { $block += "127.0.0.1 $h`r`n" }
     $block += $HostsSentinelEnd + "`r`n"
     Add-Content -Path $HostsFile -Value $block -Encoding ASCII
-    $script:HostsHijackedByUs = $true
 }
 
 function Remove-HostsHijack {
     if (-not (Test-HostsHijacked)) { return }
     $content = Get-Content $HostsFile -Raw
     $pattern = [regex]::Escape($HostsSentinelBegin) + '[\s\S]*?' + [regex]::Escape($HostsSentinelEnd) + '\r?\n?'
-    $clean = [regex]::Replace($content, $pattern, '')
-    # Drop trailing blank lines
-    $clean = $clean -replace '(\r?\n)+\Z', "`r`n"
+    $clean   = [regex]::Replace($content, $pattern, '')
+    $clean   = $clean -replace '(\r?\n)+\Z', "`r`n"
     Set-Content -Path $HostsFile -Value $clean -Encoding ASCII -NoNewline
+}
+
+# Returns the count of alive members and garbage-collects dead PID files.
+function Get-SessionActiveMemberCount {
+    if (-not (Test-Path $SessionMembersDir)) { return 0 }
+    $count = 0
+    Get-ChildItem -Path $SessionMembersDir -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $mpid = 0
+        if ([int]::TryParse($_.Name, [ref]$mpid) -and (Test-PidAlive $mpid)) {
+            $count++
+        } else {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $count
+}
+
+# Resolve the real Google IP for a host BEFORE hijacking the hosts file.
+# `Resolve-DnsName -DnsOnly` queries DNS directly and bypasses the local
+# hosts file, so we get the upstream address instead of 127.0.0.1.
+function Get-RealIp([string]$host_name) {
+    try {
+        $r = Resolve-DnsName -Name $host_name -Type A -DnsOnly -ErrorAction Stop |
+             Where-Object { $_.IPAddress -and $_.IPAddress -ne '127.0.0.1' } |
+             Select-Object -First 1
+        if ($r) { return $r.IPAddress }
+    } catch { }
+    return $null
+}
+
+# Atomic critical section using a NAMED MUTEX. PowerShell scripts run in
+# separate processes; a named mutex (Global\...) is the cleanest way to
+# serialise "join existing session OR start a new one" across launches.
+function Invoke-WithSessionLock {
+    param([Parameter(Mandatory)][scriptblock]$Body, [int]$TimeoutSec = 10)
+    $mutex = $null
+    $owned = $false
+    try {
+        $mutex = [System.Threading.Mutex]::new($false, $GlobalMutexName)
+        try {
+            $owned = $mutex.WaitOne($TimeoutSec * 1000, $false)
+        } catch [System.Threading.AbandonedMutexException] {
+            # Previous holder died without releasing — we own it now.
+            $owned = $true
+        }
+        if (-not $owned) {
+            throw "could not acquire deepantigravity session lock within ${TimeoutSec}s"
+        }
+        & $Body
+    } finally {
+        if ($mutex) {
+            if ($owned) { $mutex.ReleaseMutex() }
+            $mutex.Dispose()
+        }
+    }
 }
 
 function Show-Help {
@@ -126,7 +217,7 @@ deepantigravity — Use ``agy`` (Antigravity CLI) with Kimi or Nvidia NIM
 
 USAGE
   .\deepantigravity.ps1 -Setup                     one-time, requires admin
-  .\deepantigravity.ps1 [-b BACKEND] [agy-args]    each run requires admin (Windows)
+  .\deepantigravity.ps1 [-b BACKEND] [agy-args]    leader needs admin (1st terminal)
   .\deepantigravity.ps1 -Teardown                  requires admin
   .\deepantigravity.ps1 -Status
 
@@ -137,10 +228,16 @@ BACKENDS
   -Backend kimi                   Kimi Code             (Anthropic-native upstream)
   -Backend nv | nvidia            Nvidia NIM            (OpenAI-compat upstream)
 
+CONCURRENT SESSIONS
+  * Multiple terminals using the SAME backend share one proxy (refcounted).
+    Only the FIRST terminal needs Administrator; the rest run as regular user.
+  * DIFFERENT backends in parallel are NOT supported on Windows because
+    there is no per-process hosts-file equivalent without WSL2.
+
 PREREQUISITES
   * agy (Antigravity CLI)              https://antigravity.google/download
   * Node.js >= 18 and npm
-  * Administrator (each run, since Windows binds :443 + edits hosts file)
+  * Administrator (first launch only — to bind :443 and edit hosts file)
 
 CONFIG
   Edit proxy\.env. Set API_PROVIDER and at least one of KIMI_API_KEY,
@@ -159,9 +256,23 @@ function Show-Status {
     Write-Host "  agy:                 $(if ($agy) { $agy.Source } else { 'NOT FOUND' })"
     Write-Host "  node:                $(if ($node) { $node.Source } else { 'NOT FOUND' })"
     Write-Host "  CA cert:             $(if (Test-Path $caPemPath) { '✓ ' + $caPemPath } else { '✗ not yet generated (run -Setup)' })"
+    Write-Host "  Admin (this proc):   $(if (Test-Admin) { 'YES' } else { 'no (only leader needs admin)' })"
     Write-Host ''
     Write-Host '  Live state:'
     Write-Host "    hosts file:        $(if (Test-HostsHijacked) { 'PRESENT (a session is in progress, OR cleanup failed)' } else { 'absent (correct — agy alone uses real Google)' })"
+    if (Test-Path $SessionPidFile) {
+        $sessionPid = (Get-Content $SessionPidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        $sessionBackend = (Get-Content $SessionBackendFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($sessionPid -and (Test-PidAlive ([int]$sessionPid))) {
+            $n = Get-SessionActiveMemberCount
+            Write-Host "    Shared proxy:      PID $sessionPid (backend: $sessionBackend)"
+            Write-Host "    Active sessions:   $n"
+        } else {
+            Write-Host "    Shared proxy:      none (state is stale, will be cleaned on next launch)"
+        }
+    } else {
+        Write-Host "    Shared proxy:      none"
+    }
     Write-Host ''
     Write-Host '  Keys:'
     Write-Host "    KIMI_API_KEY:      $(Hide-Key $env:KIMI_API_KEY)"
@@ -189,7 +300,7 @@ function Show-Cost {
 function Get-CaPath {
     $ca = Join-Path $ScriptDir 'proxy\.cache\ca.pem'
     if (-not (Test-Path $ca)) {
-        Write-Host "Generating CA..."
+        Write-Host 'Generating CA...'
         Push-Location (Join-Path $ScriptDir 'proxy')
         try {
             if (-not (Test-Path 'node_modules\node-forge')) {
@@ -205,8 +316,8 @@ function Show-InstallCa {
     $ca = Get-CaPath
 @"
 
-  How to install the deepantigravity CA into Windows trust store
-  ===============================================================
+  How to install the deepantigravity CA into the Windows trust store
+  ===================================================================
 
   Note: deepantigravity does NOT need this for agy to work — agy honors
         SSL_CERT_FILE, which the launcher sets to our CA.
@@ -228,21 +339,62 @@ function Resolve-Backend {
     return $b
 }
 
-function Ensure-NodeModules {
+function Confirm-NodeModules {
     $nm = Join-Path $ScriptDir 'proxy\node_modules\node-forge'
     if (-not (Test-Path $nm)) {
-        Write-Host "  First-run setup: installing proxy dependencies..."
+        Write-Host '  First-run setup: installing proxy dependencies...'
         Push-Location (Join-Path $ScriptDir 'proxy')
         try {
             & npm install --silent --no-audit --no-fund
-            if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+            if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
         } finally { Pop-Location }
+    }
+}
+
+function Build-CaBundle([string]$caPath, [string]$bundlePath) {
+    # Combined trust bundle: our CA + the system trust store. Go's
+    # SSL_CERT_FILE REPLACES the system trust pool, so without this any
+    # non-cloudcode-pa TLS would fail with "certificate signed by
+    # unknown authority". On Windows there's no canonical PEM trust file,
+    # so we export the LocalMachine\Root + CurrentUser\Root stores.
+    try {
+        $sb = [System.Text.StringBuilder]::new()
+        $sb.AppendLine((Get-Content $caPath -Raw)) | Out-Null
+        foreach ($store in @('Cert:\CurrentUser\Root', 'Cert:\LocalMachine\Root')) {
+            try {
+                Get-ChildItem $store -ErrorAction SilentlyContinue | ForEach-Object {
+                    $bytes = $_.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+                    $b64 = [Convert]::ToBase64String($bytes, 'InsertLineBreaks')
+                    $sb.AppendLine('-----BEGIN CERTIFICATE-----') | Out-Null
+                    $sb.AppendLine($b64) | Out-Null
+                    $sb.AppendLine('-----END CERTIFICATE-----') | Out-Null
+                }
+            } catch { }
+        }
+        Set-Content -Path $bundlePath -Value $sb.ToString() -Encoding ASCII -NoNewline
+    } catch {
+        Copy-Item $caPath $bundlePath -Force
+        Write-Warning 'Could not build combined trust bundle; non-Google TLS may fail.'
+    }
+}
+
+function Free-Port([int]$port) {
+    $listeners = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+    if (-not $listeners) { return }
+    foreach ($c in $listeners) {
+        try { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    # Wait until the kernel releases it (max ~3s).
+    $n = 0
+    while ((Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) -and $n -lt 30) {
+        Start-Sleep -Milliseconds 100
+        $n++
     }
 }
 
 function Do-Setup {
     if (-not (Test-Admin)) {
-        Write-Host "  -Setup needs Administrator. Re-launching elevated..."
+        Write-Host '  -Setup needs Administrator. Re-launching elevated...'
         $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Setup')
         Start-Process -FilePath 'powershell.exe' -ArgumentList $args -Verb RunAs -Wait
         return
@@ -250,132 +402,270 @@ function Do-Setup {
     Write-Host ''
     Write-Host '  deepantigravity — one-time setup (Windows)'
     Write-Host '  =========================================='
-    Write-Host '  Setup just regenerates the CA. Each launch needs admin'
-    Write-Host '  on Windows because we modify the hosts file and bind :443.'
+    Write-Host '  Setup just regenerates the CA. Each LEADER launch (first'
+    Write-Host '  terminal of a backend) needs admin to bind :443 and modify'
+    Write-Host '  the hosts file. Subsequent terminals using the same'
+    Write-Host '  backend can run as a regular user.'
     Write-Host ''
-    Ensure-NodeModules
+    Confirm-NodeModules
     & node (Join-Path $ScriptDir 'proxy\cert.js') | Out-Null
     Write-Host ''
-    Write-Host '  ✓ Setup complete. Launch with admin PowerShell:'
-    Write-Host '      .\deepantigravity.ps1 -Backend kiro'
+    Write-Host '  ✓ Setup complete. Launch with:'
+    Write-Host '      .\deepantigravity.ps1 -b kimi      # leader (admin needed)'
+    Write-Host '      .\deepantigravity.ps1 -b kimi      # follower (regular user)'
     Write-Host ''
 }
 
 function Do-Teardown {
     if (-not (Test-Admin)) {
-        Write-Host "  -Teardown needs Administrator. Re-launching elevated..."
+        Write-Host '  -Teardown needs Administrator. Re-launching elevated...'
         $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Teardown')
         Start-Process -FilePath 'powershell.exe' -ArgumentList $args -Verb RunAs -Wait
         return
     }
-    Remove-HostsHijack
-    Write-Host '  ✓ /etc/hosts (hosts file) cleaned. agy is back to normal.'
-}
-
-$ProxyProcess = $null
-function Cleanup-OnExit {
-    if ($script:ProxyProcess -and -not $script:ProxyProcess.HasExited) {
-        Stop-Process -Id $script:ProxyProcess.Id -Force -ErrorAction SilentlyContinue
-    }
-    if ($script:HostsHijackedByUs) {
-        if (Test-Admin) {
-            try { Remove-HostsHijack } catch {}
-        } else {
-            Write-Warning "Cannot remove hosts entries without admin. Run -Teardown later."
+    # Kill any running shared proxy
+    if (Test-Path $SessionPidFile) {
+        $pp = (Get-Content $SessionPidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($pp -and (Test-PidAlive ([int]$pp))) {
+            Stop-Process -Id ([int]$pp) -Force -ErrorAction SilentlyContinue
+            Write-Host "  Stopped shared proxy (PID $pp)"
         }
     }
+    if (Test-Path $SessionDir) {
+        Remove-Item $SessionDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    # Free :443 if anything else is bound
+    Free-Port ([int]$DeepantigravityPort)
+    # Clean hosts file
+    Remove-HostsHijack
+    Write-Host '  ✓ deepantigravity stopped, hosts file cleaned. agy is back to normal.'
+}
+
+# ── Cleanup runs on every exit. Refcount-based teardown like the Linux trap. ──
+function Invoke-CleanupOnExit {
+    if (-not $script:JoinedSession) { return }
+    try {
+        Invoke-WithSessionLock -TimeoutSec 5 -Body {
+            $myFile = Join-Path $SessionMembersDir "$PID"
+            Remove-Item -LiteralPath $myFile -Force -ErrorAction SilentlyContinue
+
+            $active = Get-SessionActiveMemberCount
+            if ($active -gt 0) { return }
+
+            # We're the last one out — tear down the shared proxy.
+            if (Test-Path $SessionPidFile) {
+                $pp = (Get-Content $SessionPidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+                if ($pp -and (Test-PidAlive ([int]$pp))) {
+                    Stop-Process -Id ([int]$pp) -Force -ErrorAction SilentlyContinue
+                }
+            }
+            if (Test-Admin) {
+                try { Remove-HostsHijack } catch {}
+            } else {
+                # Followers can't modify hosts file. Leader (still alive)
+                # would have done it normally. If we ARE the last out and
+                # not admin, log a warning.
+                Write-Warning 'Last-out cleanup: cannot remove hosts entries without admin. Run -Teardown.'
+            }
+            if (Test-Path $SessionDir) {
+                Remove-Item $SessionDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        # Best-effort cleanup. Drop our member file even if locking failed.
+        try {
+            $myFile = Join-Path $SessionMembersDir "$PID"
+            Remove-Item -LiteralPath $myFile -Force -ErrorAction SilentlyContinue
+        } catch {}
+    }
+    $script:JoinedSession = $false
+}
+
+# ── Re-launch this script as admin and wait for it to finish. ──
+function Invoke-AsAdmin {
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+    if ($Backend)       { $argList += @('-Backend', $Backend) }
+    if ($AgyArgs)       { $argList += '--'; $argList += $AgyArgs }
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -Wait
 }
 
 function Launch-Agy {
-    if (-not (Test-Admin)) {
-        throw "Each launch needs Administrator on Windows. Open an elevated PowerShell, then re-run."
-    }
-
     $resolved = Resolve-Backend
-    Ensure-NodeModules
+    Confirm-NodeModules
 
-    Write-Host "  Adding hosts file redirect for cloudcode-pa.googleapis.com..."
-    Add-HostsHijack
+    if (-not (Test-Path $SessionDir))        { New-Item -ItemType Directory -Path $SessionDir -Force | Out-Null }
+    if (-not (Test-Path $SessionMembersDir)) { New-Item -ItemType Directory -Path $SessionMembersDir -Force | Out-Null }
 
-    Write-Host "  Starting deepantigravity TLS server → $resolved ..."
+    # ── Atomic: JOIN existing session, REFUSE if backend differs, or START. ──
+    $script:NeedsLeader = $false
+    Invoke-WithSessionLock -TimeoutSec 10 -Body {
+        $existingPid = $null
+        $existingBackend = $null
+        if (Test-Path $SessionPidFile) {
+            $existingPid = (Get-Content $SessionPidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        }
+        if (Test-Path $SessionBackendFile) {
+            $existingBackend = (Get-Content $SessionBackendFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        }
 
-    $stale = Get-NetTCPConnection -LocalPort $DeepantigravityPort -State Listen -ErrorAction SilentlyContinue
-    if ($stale) {
-        $stale | ForEach-Object {
-            try { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } catch {}
+        $alive = $existingPid -and (Test-PidAlive ([int]$existingPid))
+
+        if ($alive -and $existingBackend -eq $resolved) {
+            # JOIN: just register ourselves and use the existing bundle.
+            if (-not (Test-Path $SessionBundleFile)) {
+                throw 'session is corrupted (proxy alive but ca-bundle missing). Stop the running session and try again.'
+            }
+            New-Item -ItemType File -Path (Join-Path $SessionMembersDir "$PID") -Force | Out-Null
+            $script:JoinedSession = $true
+            $n = Get-SessionActiveMemberCount
+            Write-Host "  Joined shared session: backend=$existingBackend, proxy PID=$existingPid ($n session(s) active)"
+            $env:SSL_CERT_FILE = $SessionBundleFile
+            $env:SSL_CERT_DIR  = (Split-Path -Parent $SessionBundleFile)
+        }
+        elseif ($alive -and $existingBackend -ne $resolved) {
+            # REFUSE: backend mismatch. Windows can't multiplex backends.
+            $n = Get-SessionActiveMemberCount
+            $msg = @"
+another deepantigravity session is running with a DIFFERENT backend
+  Running backend: $existingBackend  (proxy PID $existingPid, $n session(s) active)
+  Requested:       $resolved
+
+  Windows does not support different backends in parallel because
+  there is no per-process hosts-file equivalent. Either re-run with
+  -b $existingBackend, or stop the other sessions.
+"@
+            throw $msg
+        }
+        else {
+            # START: no live proxy — we need to be the leader.
+            $script:NeedsLeader = $true
         }
     }
 
-    $stdoutFile = [IO.Path]::GetTempFileName()
-    $stderrFile = [IO.Path]::GetTempFileName()
-
-    $script:ProxyProcess = Start-Process -FilePath 'node' `
-        -ArgumentList @((Join-Path $ScriptDir 'proxy\start-proxy.js'), $resolved, $DeepantigravityPort) `
-        -PassThru -WindowStyle Hidden `
-        -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
-
-    $port = $null; $caPath = $null
-    $tries = 0
-    while ($tries -lt 60) {
-        if (Test-Path $stdoutFile) {
-            $lines = Get-Content $stdoutFile -ErrorAction SilentlyContinue
-            $port  = $lines | Where-Object { $_ -match '^\d+$' } | Select-Object -First 1
-            $caPath = $lines | Where-Object { $_ -match '^[A-Z]:|^/' } | Select-Object -First 1
-            if ($port -and $caPath -and (Test-Path $caPath)) { break }
-        }
-        if ($script:ProxyProcess.HasExited) {
-            Write-Host "ERROR: proxy died on startup" -ForegroundColor Red
-            if (Test-Path $stderrFile) { Get-Content $stderrFile | Write-Host -ForegroundColor DarkGray }
-            Remove-Item $stdoutFile, $stderrFile -ErrorAction SilentlyContinue
-            throw "proxy failed"
-        }
-        Start-Sleep -Milliseconds 100
-        $tries++
-    }
-    if (-not $port -or -not $caPath -or -not (Test-Path $caPath)) {
-        if (Test-Path $stderrFile) { Get-Content $stderrFile | Write-Host -ForegroundColor DarkGray }
-        Remove-Item $stdoutFile, $stderrFile -ErrorAction SilentlyContinue
-        throw "proxy startup output unexpected"
+    if (-not $script:NeedsLeader) {
+        # We're a follower: just exec agy with the existing bundle.
+        & agy @AgyArgs
+        return
     }
 
-    Write-Host "  TLS server on 127.0.0.1:$port  → $resolved"
-    Write-Host "  CA: $caPath"
-    Write-Host ''
-    Remove-Item $stdoutFile, $stderrFile -ErrorAction SilentlyContinue
+    # ── Leader path: needs admin (bind :443 + modify hosts file) ──
+    if (-not (Test-Admin)) {
+        Write-Host '  No active session — starting one. Leader needs Administrator.'
+        Write-Host '  Re-launching elevated...'
+        Invoke-AsAdmin
+        return
+    }
 
-    # Build a combined trust bundle: our CA + system roots.
-    # Go's SSL_CERT_FILE REPLACES the system trust pool — pointing agy
-    # at our CA alone makes non-cloudcode-pa traffic (oauth2 userinfo,
-    # accounts.google.com, etc.) fail with "certificate signed by unknown
-    # authority". On Windows there is no canonical PEM trust file, so we
-    # export the LocalMachine\Root store on the fly.
-    $bundlePath = Join-Path (Split-Path -Parent $caPath) 'ca-bundle.pem'
-    try {
-        $sb = [System.Text.StringBuilder]::new()
-        # Our CA first (so it takes precedence for cloudcode-pa.googleapis.com)
-        $sb.AppendLine((Get-Content $caPath -Raw)) | Out-Null
-        # Append every cert from the user+machine Root stores
-        foreach ($store in @('Cert:\CurrentUser\Root', 'Cert:\LocalMachine\Root')) {
-            try {
-                Get-ChildItem $store | ForEach-Object {
-                    $bytes = $_.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
-                    $b64 = [Convert]::ToBase64String($bytes, 'InsertLineBreaks')
-                    $sb.AppendLine("-----BEGIN CERTIFICATE-----") | Out-Null
-                    $sb.AppendLine($b64) | Out-Null
-                    $sb.AppendLine("-----END CERTIFICATE-----") | Out-Null
+    # We are admin. Take the lock again and do the full leader flow.
+    Invoke-WithSessionLock -TimeoutSec 10 -Body {
+        # Re-check (another launcher may have raced ahead while we elevated)
+        $existingPid = $null
+        if (Test-Path $SessionPidFile) {
+            $existingPid = (Get-Content $SessionPidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        }
+        if ($existingPid -and (Test-PidAlive ([int]$existingPid))) {
+            $existingBackend = (Get-Content $SessionBackendFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ($existingBackend -eq $resolved) {
+                New-Item -ItemType File -Path (Join-Path $SessionMembersDir "$PID") -Force | Out-Null
+                $script:JoinedSession = $true
+                Write-Host "  Joined shared session that started while elevating (proxy PID $existingPid)"
+                $env:SSL_CERT_FILE = $SessionBundleFile
+                $env:SSL_CERT_DIR  = (Split-Path -Parent $SessionBundleFile)
+                return
+            } else {
+                throw "another session started a different backend while we elevated: $existingBackend"
+            }
+        }
+
+        # Wipe stale state
+        Remove-Item $SessionPidFile, $SessionBackendFile, $SessionBundleFile, $SessionLogFile -Force -ErrorAction SilentlyContinue
+        Remove-Item $SessionMembersDir -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $SessionMembersDir -Force | Out-Null
+
+        # Clean any stale hosts hijack from a crashed previous session.
+        if (Test-HostsHijacked) {
+            Write-Host '  Cleaning stale hosts file entries from a previous session...'
+            Remove-HostsHijack
+        }
+
+        # Resolve real Google IPs BEFORE hijacking. -DnsOnly bypasses the
+        # local hosts file, so we get the upstream address directly.
+        $cloudIp = Get-RealIp 'cloudcode-pa.googleapis.com'
+        $dailyIp = Get-RealIp 'daily-cloudcode-pa.googleapis.com'
+        if (-not $cloudIp) { throw "could not resolve real IP of cloudcode-pa.googleapis.com (Resolve-DnsName -DnsOnly returned nothing)" }
+        if (-not $dailyIp) { $dailyIp = $cloudIp }
+        Write-Host "  Real IPs: cloudcode-pa → $cloudIp, daily-cloudcode-pa → $dailyIp"
+
+        # Add hosts hijack
+        Write-Host '  Adding hosts file redirect for cloudcode-pa.googleapis.com...'
+        Add-HostsHijack
+
+        # Free :443 if something else is bound (orphan from earlier crash)
+        Free-Port ([int]$DeepantigravityPort)
+
+        # Spawn proxy DETACHED. On Windows, Start-Process without -Wait
+        # creates a child that survives this script's exit (no SIGHUP).
+        Write-Host "  Starting deepantigravity TLS server → $resolved ..."
+        $proxyScript = Join-Path $ScriptDir 'proxy\start-proxy.js'
+        # Set REAL_IP env vars for the proxy child (it needs them to forward
+        # bootstrap calls to real Google with the hosts file hijacked).
+        [Environment]::SetEnvironmentVariable('DEEPANTIGRAVITY_REAL_IP_CLOUDCODE', $cloudIp, 'Process')
+        [Environment]::SetEnvironmentVariable('DEEPANTIGRAVITY_REAL_IP_DAILY',     $dailyIp, 'Process')
+
+        $proc = Start-Process -FilePath 'node' `
+            -ArgumentList @($proxyScript, $resolved, $DeepantigravityPort) `
+            -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $SessionLogFile `
+            -RedirectStandardError  "$SessionLogFile.err"
+
+        # Wait for the "port\nca-path" lines.
+        $port = $null; $caPath = $null
+        $tries = 0
+        while ($tries -lt 60) {
+            if (Test-Path $SessionLogFile) {
+                $lines = Get-Content $SessionLogFile -ErrorAction SilentlyContinue
+                $port  = $lines | Where-Object { $_ -match '^\d+$' } | Select-Object -First 1
+                $caPath = $lines | Where-Object { $_ -match '^[A-Z]:|^/' } | Select-Object -First 1
+                if ($port -and $caPath -and (Test-Path $caPath)) { break }
+            }
+            if ($proc.HasExited) {
+                Write-Host 'ERROR: proxy died on startup' -ForegroundColor Red
+                if (Test-Path "$SessionLogFile.err") {
+                    Get-Content "$SessionLogFile.err" | Write-Host -ForegroundColor DarkGray
                 }
-            } catch { }
+                Remove-HostsHijack
+                throw 'proxy failed to start'
+            }
+            Start-Sleep -Milliseconds 100
+            $tries++
         }
-        Set-Content -Path $bundlePath -Value $sb.ToString() -Encoding ASCII -NoNewline
-    } catch {
-        # Fall back to our CA alone
-        Copy-Item $caPath $bundlePath -Force
-        Write-Warning "Could not build combined trust bundle; non-Google TLS may fail."
+        if (-not $port -or -not $caPath -or -not (Test-Path $caPath)) {
+            if (Test-Path "$SessionLogFile.err") {
+                Get-Content "$SessionLogFile.err" | Write-Host -ForegroundColor DarkGray
+            }
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+            Remove-HostsHijack
+            throw 'proxy startup output unexpected'
+        }
+
+        # Build the combined CA bundle.
+        Build-CaBundle $caPath $SessionBundleFile
+
+        # Record session state and register self as first member.
+        Set-Content -Path $SessionPidFile     -Value "$($proc.Id)" -Encoding ASCII
+        Set-Content -Path $SessionBackendFile -Value $resolved      -Encoding ASCII
+        New-Item -ItemType File -Path (Join-Path $SessionMembersDir "$PID") -Force | Out-Null
+        $script:JoinedSession = $true
+
+        Write-Host "  TLS server on 127.0.0.1:$port  → $resolved  (proxy PID $($proc.Id))"
+        Write-Host "  CA bundle: $SessionBundleFile"
+        Write-Host ''
+
+        $env:SSL_CERT_FILE = $SessionBundleFile
+        $env:SSL_CERT_DIR  = (Split-Path -Parent $SessionBundleFile)
     }
 
-    $env:SSL_CERT_FILE = $bundlePath
-    $env:SSL_CERT_DIR  = (Split-Path -Parent $bundlePath)
-
+    # Run agy in foreground. Cleanup runs in finally{}.
     & agy @AgyArgs
 }
 
@@ -390,5 +680,5 @@ try {
     if ($InstallCa)   { Show-InstallCa; return }
     Launch-Agy
 } finally {
-    Cleanup-OnExit
+    Invoke-CleanupOnExit
 }
