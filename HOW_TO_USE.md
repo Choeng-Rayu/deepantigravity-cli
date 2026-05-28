@@ -30,6 +30,7 @@ You need three things:
 git clone https://github.com/<you>/deepantigravity-cli.git
 cd deepantigravity-cli
 cd proxy && npm install && cd ..
+chmod +x deepantigravity.sh
 ```
 
 Set up your API keys:
