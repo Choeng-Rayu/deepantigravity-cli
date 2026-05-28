@@ -82,6 +82,7 @@ All items should show ✓. After this, **no more sudo needed**.
 ./deepantigravity.sh              # uses default backend from .env
 ./deepantigravity.sh -b kimi      # force Kimi Code
 ./deepantigravity.sh -b nv        # force Nvidia NIM
+./deepantigravity.sh --status     # check setup and running state
 ```
 
 ### Pass arguments to agy
