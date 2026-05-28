@@ -146,6 +146,7 @@ The local CA key stays at `proxy/.cache/ca-key.pem` (mode 0600). Only `cloudcode
 | `agy` alone gives "connection refused" | Previous session crashed. Run `--teardown` |
 | x509 certificate error | Run `--setup` again to rebuild the CA bundle |
 | EACCES bind port 443 | Run `--setup` again (re-grants capability) |
+| agy hangs with no output | Run with `DEEPANTIGRAVITY_DEBUG=1` to check upstream errors |
 
 See [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) for detailed solutions or [`HOW_TO_USE.md`](HOW_TO_USE.md) for the full practical guide.
 
