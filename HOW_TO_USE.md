@@ -127,6 +127,8 @@ DEEPANTIGRAVITY_DEBUG=1 ./deepantigravity.sh -b kimi -- --print "test"
 
 This logs request/response bodies to `proxy/.cache/requests/` and shows translation details in the terminal.
 
+Check token usage: `./deepantigravity.sh --cost`
+
 ---
 
 ## Troubleshooting
