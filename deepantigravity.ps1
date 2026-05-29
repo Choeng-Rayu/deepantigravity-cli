@@ -111,7 +111,7 @@ function Test-Admin {
     # On non-Windows hosts (e.g. PowerShell Core on Linux), the
     # WindowsPrincipal API throws. Treat that as "not admin" so the
     # script can still display status / help without failing.
-    if ($IsLinux -or $IsMacOS) {
+    if ((Get-Variable IsLinux -ErrorAction SilentlyContinue) -and ($IsLinux -or $IsMacOS)) {
         # Linux/macOS proxy of "is admin" — true iff EUID == 0.
         try { return ((id -u 2>/dev/null) -eq '0') } catch { return $false }
     }

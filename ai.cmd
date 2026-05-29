@@ -1,0 +1,3 @@
+@echo off
+echo Starting AI proxy...
+powershell -ExecutionPolicy Bypass -File "D:\deepantigravity-cli\deepantigravity.ps1" -Backend nv %*
