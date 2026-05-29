@@ -52,9 +52,23 @@ export function anthropicToOpenAI(body, targetModel) {
         }
     }
 
+    // Normalize so the sequence satisfies OpenAI-compat chat-template
+    // rules (qwen, mistral, etc. are strict and 400 otherwise).
+    const normalized = normalizeForOpenAI(messages);
+
+    // OpenAI-compat servers build the next-turn prompt with
+    // `add_generation_prompt=True`, which REQUIRES the last message to
+    // NOT be an assistant message — otherwise they 400 with "Cannot set
+    // add_generation_prompt to True when the last message is from the
+    // assistant". agy's history can end on an assistant turn, so append
+    // a minimal user nudge to give the server a turn to generate from.
+    if (normalized.length > 0 && normalized[normalized.length - 1].role === 'assistant') {
+        normalized.push({ role: 'user', content: 'Continue.' });
+    }
+
     const result = {
         model: targetModel || body.model,
-        messages,
+        messages: normalized,
         stream: body.stream !== false,  // default to streaming
     };
 
@@ -112,6 +126,66 @@ export function anthropicToOpenAI(body, targetModel) {
 }
 
 /**
+ * Make a flat OpenAI message list satisfy the strict chat-template rules
+ * that OpenAI-compatible servers (qwen, mistral, etc.) enforce:
+ *
+ *   1. Every `assistant` message that has `tool_calls` must be followed
+ *      by EXACTLY one `tool` message per tool_call id (same count, same
+ *      ids). agy histories can have partial results (model called 2
+ *      tools, only 1 result present yet) → "Not the same number of
+ *      function calls and responses". We synthesize a placeholder result
+ *      for any missing id and drop `tool` messages that reference an id
+ *      not present in the immediately-preceding assistant turn.
+ *   2. No two `assistant` messages back-to-back (consecutive model turns
+ *      from Gemini). We merge them so tool_calls stay attached to their
+ *      results.
+ */
+function normalizeForOpenAI(msgs) {
+    // Pass 1: merge consecutive assistant messages.
+    const merged = [];
+    for (const m of msgs) {
+        const prev = merged[merged.length - 1];
+        if (m.role === 'assistant' && prev && prev.role === 'assistant') {
+            // Concatenate text content and tool_calls.
+            const txt = [prev.content, m.content].filter(Boolean).join('');
+            prev.content = txt || null;
+            const tc = [...(prev.tool_calls || []), ...(m.tool_calls || [])];
+            if (tc.length) prev.tool_calls = tc;
+            continue;
+        }
+        merged.push({ ...m });
+    }
+
+    // Pass 2: reconcile tool_calls with following tool messages.
+    const out = [];
+    for (let i = 0; i < merged.length; i++) {
+        const m = merged[i];
+        out.push(m);
+        if (m.role !== 'assistant' || !m.tool_calls || m.tool_calls.length === 0) continue;
+
+        // Collect the contiguous tool messages that follow.
+        const provided = new Map();   // id → tool message
+        let j = i + 1;
+        while (j < merged.length && merged[j].role === 'tool') {
+            provided.set(merged[j].tool_call_id, merged[j]);
+            j++;
+        }
+        // Emit exactly one tool message per call id, in call order.
+        for (const call of m.tool_calls) {
+            if (provided.has(call.id)) {
+                out.push(provided.get(call.id));
+            } else {
+                // Missing result → synthesize a neutral placeholder so the
+                // counts match (the model called it but no result arrived).
+                out.push({ role: 'tool', tool_call_id: call.id, content: '' });
+            }
+        }
+        i = j - 1;   // skip the tool messages we just consumed (orphans dropped)
+    }
+    return out;
+}
+
+/**
  * Convert a single Anthropic message to OpenAI message(s).
  */
 function convertAnthropicMessage(msg) {
@@ -138,7 +212,29 @@ function convertUserMessage(msg) {
 
         const results = [];
 
-        // Non-tool blocks become a user message
+        // IMPORTANT: emit tool messages FIRST. OpenAI-compat servers
+        // require every assistant(tool_calls) message to be immediately
+        // followed by its tool message(s); a user/text message in between
+        // is a 400. A single Gemini `user` turn can carry BOTH a
+        // functionResponse and extra text, so order tools before text.
+        for (const tr of toolResults) {
+            let content = '';
+            if (typeof tr.content === 'string') {
+                content = tr.content;
+            } else if (Array.isArray(tr.content)) {
+                content = tr.content
+                    .filter(b => b.type === 'text')
+                    .map(b => b.text)
+                    .join('\n');
+            }
+            results.push({
+                role: 'tool',
+                tool_call_id: tr.tool_use_id,
+                content: content || '',
+            });
+        }
+
+        // Non-tool blocks become a user message (after the tool messages)
         if (otherBlocks.length > 0) {
             const parts = [];
             for (const block of otherBlocks) {
@@ -166,24 +262,6 @@ function convertUserMessage(msg) {
             } else if (parts.length > 0) {
                 results.push({ role: 'user', content: parts });
             }
-        }
-
-        // Tool results become tool messages
-        for (const tr of toolResults) {
-            let content = '';
-            if (typeof tr.content === 'string') {
-                content = tr.content;
-            } else if (Array.isArray(tr.content)) {
-                content = tr.content
-                    .filter(b => b.type === 'text')
-                    .map(b => b.text)
-                    .join('\n');
-            }
-            results.push({
-                role: 'tool',
-                tool_call_id: tr.tool_use_id,
-                content: content || '',
-            });
         }
 
         return results.length === 1 ? results[0] : results;

@@ -79,6 +79,9 @@ export function geminiToAnthropic(geminiBody, targetModel) {
 
     const messages = [];
     let systemText = null;
+    // Tracks tool_use ids already paired with a functionResponse, so
+    // repeated tool names map to distinct calls (see _matchToolUseId).
+    const _consumedToolIds = new Set();
 
     // System instruction → Anthropic `system`
     if (sysInstr) {
@@ -119,7 +122,7 @@ export function geminiToAnthropic(geminiBody, targetModel) {
             } else if (p.functionResponse) {
                 blocks.push({
                     type: 'tool_result',
-                    tool_use_id: p.functionResponse.id || _matchToolUseId(messages, p.functionResponse.name),
+                    tool_use_id: p.functionResponse.id || _matchToolUseId(messages, p.functionResponse.name, _consumedToolIds),
                     content: stringifyForToolResult(p.functionResponse.response),
                 });
             }
@@ -222,16 +225,26 @@ function stringifyForToolResult(v) {
 }
 
 /**
- * Best-effort: find the most recent assistant tool_use block whose name
- * matches, and return its id. Used when Gemini's functionResponse parts
- * lack an explicit `id` field (which is common from `agy`).
+ * Best-effort: find the EARLIEST unconsumed assistant tool_use block
+ * whose name matches, mark it consumed, and return its id. Used when
+ * Gemini's functionResponse parts lack an explicit `id` (common from
+ * `agy`). Consuming ids in order is critical: when the model calls the
+ * same tool name multiple times (e.g. read_file ×2), each response must
+ * map to a DISTINCT tool_use id — otherwise OpenAI-compat backends
+ * (qwen, etc.) reject the conversation because a tool_call has no
+ * matching tool result and another id is duplicated.
+ *
+ * @param {Set<string>} consumed — ids already paired with a response.
  */
-function _matchToolUseId(messages, name) {
-    for (let i = messages.length - 1; i >= 0; i--) {
+function _matchToolUseId(messages, name, consumed) {
+    for (let i = 0; i < messages.length; i++) {
         const m = messages[i];
         if (m.role !== 'assistant' || !Array.isArray(m.content)) continue;
         for (const b of m.content) {
-            if (b.type === 'tool_use' && b.name === name) return b.id;
+            if (b.type === 'tool_use' && b.name === name && !consumed.has(b.id)) {
+                consumed.add(b.id);
+                return b.id;
+            }
         }
     }
     return `toolu_${randHex(12)}`;

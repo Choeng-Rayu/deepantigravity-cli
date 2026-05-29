@@ -87,15 +87,24 @@ const DEEPANTIGRAVITY_KEY_PREFIX = 'dag-';
 
 // Default curated Nvidia coding models. Override via NVIDIA_MODELS in
 // proxy/.env (comma-separated upstream model ids).
+// Ordered FAST → SLOW. The first few stream quickly enough for agentic
+// tool loops and `--print`; the trailing 250B–675B models are capable
+// but slow and may time out on large agentic payloads.
 const DEFAULT_NVIDIA_MODELS = [
+    // ── fast & reliable for agentic/tool use (recommended) ──
     'openai/gpt-oss-120b',
     'openai/gpt-oss-20b',
-    'qwen/qwen3-coder-480b-a35b-instruct',
-    'deepseek-ai/deepseek-v4-pro',
-    'moonshotai/kimi-k2.6',
     'stepfun-ai/step-3.7-flash',
+    'deepseek-ai/deepseek-v4-flash',
     'meta/llama-3.3-70b-instruct',
-    'nvidia/llama-3.3-nemotron-super-49b-v1.5',
+    // ── strong but slower ──
+    'moonshotai/kimi-k2.6',
+    'deepseek-ai/deepseek-v4-pro',
+    'qwen/qwen3-coder-480b-a35b-instruct',
+    // ── very large / slow (may time out on big tool payloads) ──
+    'qwen/qwen3.5-397b-a17b',
+    'nvidia/nemotron-3-super-120b-a12b',
+    'mistralai/mistral-large-3-675b-instruct-2512',
 ];
 
 // Map an upstream model id to a stable agy map key (alnum + dash only).
@@ -716,6 +725,15 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
             upRes.on('data', c => { errBody += c.toString(); });
             upRes.on('end', () => {
                 console.error(`[deepantigravity]     upstream error body: ${errBody.slice(0, 500)}`);
+                // Diagnostic: dump the message-role shape so 400s about
+                // tool-call/result pairing or ordering are self-evident.
+                try {
+                    const seq = (openaiBody.messages || []).map(m =>
+                        m.role + (m.tool_calls ? `(calls:${m.tool_calls.length})` : '')
+                              + (m.role === 'tool' ? `(id:${String(m.tool_call_id).slice(-6)})` : '')
+                    ).join(' → ');
+                    console.error(`[deepantigravity]     request msg shape: ${seq}`);
+                } catch {}
                 res.end(errBody);
             });
             return;
