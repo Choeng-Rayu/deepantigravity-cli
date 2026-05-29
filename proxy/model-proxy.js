@@ -36,7 +36,15 @@ import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { resolve4 } from 'dns/promises';
+import { setDefaultResultOrder } from 'dns';
 import { createRequire } from 'module';
+
+// Prefer IPv4 globally. On Windows, Node's getaddrinfo often returns an
+// IPv6 (AAAA) address first; when the host's IPv6 routing is incomplete
+// this surfaces as ENOTFOUND / EHOSTUNREACH on outbound connections
+// (e.g. integrate.api.nvidia.com, googleapis.com). Forcing IPv4-first
+// resolution avoids that. Harmless on Linux/macOS.
+try { setDefaultResultOrder('ipv4first'); } catch { /* older node */ }
 
 import { ensureCA, makeLeafCertForHost } from './cert.js';
 import {
@@ -151,6 +159,24 @@ async function getRealIp(host) {
     }
     _realIpCache.set(host, ip);
     return ip;
+}
+
+// Return ALL candidate IPv4 addresses for a host, preferring the cached
+// one first. dns.resolve4 queries DNS servers directly (it does NOT read
+// the hosts file), so it works even with our cloudcode-pa hijack active.
+// Used to retry a different IP when the first is unroutable (Windows
+// sometimes gets EHOSTUNREACH on a specific Google front-end IP).
+async function getRealIpCandidates(host) {
+    const out = [];
+    const cached = _realIpCache.get(host);
+    if (cached && cached !== '127.0.0.1') out.push(cached);
+    try {
+        const addrs = await resolve4(host);
+        for (const a of (addrs || [])) {
+            if (a && a !== '127.0.0.1' && !out.includes(a)) out.push(a);
+        }
+    } catch { /* DNS may fail; cached entry (if any) still tried */ }
+    return out;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -317,8 +343,6 @@ export async function startProxy(opts) {
  * to bypass /etc/hosts).
  */
 async function forwardToRealGoogle(req, res, body, upstreamHost) {
-    const realIp = await getRealIp(upstreamHost);
-
     // Strip hop-by-hop headers; preserve Authorization (the OAuth Bearer
     // token agy is sending).
     const fwdHeaders = { ...req.headers };
@@ -330,32 +354,54 @@ async function forwardToRealGoogle(req, res, body, upstreamHost) {
         fwdHeaders['content-length'] = String(body.length);
     }
 
-    const upstream = httpsRequest({
-        host: realIp,
-        port: 443,
-        method: req.method,
-        path: req.url,
-        headers: fwdHeaders,
-        servername: upstreamHost,    // SNI must be the real hostname
-        timeout: REQUEST_TIMEOUT_MS,
-        // Use the OS's default trust store (Google's real CA chain)
-    }, (upRes) => {
-        const respHeaders = { ...upRes.headers };
-        delete respHeaders['transfer-encoding']; // node re-chunks
-        res.writeHead(upRes.statusCode, upRes.statusMessage, respHeaders);
-        upRes.pipe(res);
-    });
+    // Try each candidate IP in turn. On Windows a specific Google
+    // front-end IP can be unroutable (EHOSTUNREACH); the next one
+    // usually works. Cache the IP that succeeds for next time.
+    let candidates = await getRealIpCandidates(upstreamHost);
+    if (candidates.length === 0) {
+        res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { code: 502, message: `could not resolve ${upstreamHost}` } }));
+        return;
+    }
 
-    upstream.on('error', (e) => {
-        console.error(`[deepantigravity] forward error to ${upstreamHost} (${realIp}): ${e.message}`);
-        if (!res.headersSent) {
-            res.writeHead(502, { 'content-type': 'application/json' });
-        }
-        res.end(JSON.stringify({ error: { code: 502, message: e.message } }));
-    });
+    const tryIp = (idx) => {
+        const realIp = candidates[idx];
+        const upstream = httpsRequest({
+            host: realIp,
+            port: 443,
+            method: req.method,
+            path: req.url,
+            headers: fwdHeaders,
+            servername: upstreamHost,    // SNI must be the real hostname
+            timeout: REQUEST_TIMEOUT_MS,
+            family: 4,
+        }, (upRes) => {
+            _realIpCache.set(upstreamHost, realIp);   // remember the good IP
+            const respHeaders = { ...upRes.headers };
+            delete respHeaders['transfer-encoding']; // node re-chunks
+            res.writeHead(upRes.statusCode, upRes.statusMessage, respHeaders);
+            upRes.pipe(res);
+        });
 
-    if (body && body.length) upstream.write(body);
-    upstream.end();
+        upstream.on('error', (e) => {
+            // Try the next candidate IP on a routing/connection failure.
+            if (idx + 1 < candidates.length) {
+                if (_realIpCache.get(upstreamHost) === realIp) _realIpCache.delete(upstreamHost);
+                console.error(`[deepantigravity] forward ${upstreamHost} via ${realIp} failed (${e.code || e.message}); trying next IP`);
+                tryIp(idx + 1);
+                return;
+            }
+            console.error(`[deepantigravity] forward error to ${upstreamHost} (${realIp}): ${e.message}`);
+            if (!res.headersSent) {
+                res.writeHead(502, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ error: { code: 502, message: e.message } }));
+            }
+        });
+
+        if (body && body.length) upstream.write(body);
+        upstream.end();
+    };
+    tryIp(0);
 }
 
 
@@ -383,6 +429,7 @@ async function forwardAndRewriteModels(req, res, body, upstreamHost, opts) {
         headers: fwdHeaders,
         servername: upstreamHost,
         timeout: REQUEST_TIMEOUT_MS,
+        family: 4,
     }, (upRes) => {
         const chunks = [];
         upRes.on('data', (c) => chunks.push(c));
@@ -562,6 +609,7 @@ async function forwardAnthropic(res, anthBody, opts, geminiModel, onUsage) {
         path: rebasePath(upstreamUrl.pathname, messagesPath),
         headers,
         timeout: REQUEST_TIMEOUT_MS,
+        family: 4,
     }, (upRes) => {
         console.error(`[deepantigravity]     upstream replied: ${upRes.statusCode} ${upRes.statusMessage}`);
         if (upRes.statusCode !== 200) {
@@ -659,6 +707,7 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
         path: rebasePath(upstreamUrl.pathname, '/chat/completions'),
         headers,
         timeout: REQUEST_TIMEOUT_MS,
+        family: 4,
     }, (upRes) => {
         console.error(`[deepantigravity]     upstream replied: ${upRes.statusCode} ${upRes.statusMessage}`);
         if (upRes.statusCode !== 200) {
