@@ -23,6 +23,37 @@
  */
 
 import { startProxy } from './model-proxy.js';
+import { readFileSync, existsSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+
+// Load proxy/.env into process.env (without overriding already-set vars)
+// so the proxy works even when launched via sudo (macOS), where the
+// parent shell's exported keys don't cross the privilege boundary.
+(function loadDotEnv() {
+    try {
+        const here = dirname(fileURLToPath(import.meta.url));
+        const candidates = [
+            join(here, '.env'),
+            join(here, '.cache', 'macos-session', 'proxy.env'),  // real IPs (macOS)
+        ];
+        for (const envPath of candidates) {
+            if (!existsSync(envPath)) continue;
+            for (let line of readFileSync(envPath, 'utf8').split('\n')) {
+                line = line.trim();
+                if (!line || line.startsWith('#')) continue;
+                const eq = line.indexOf('=');
+                if (eq <= 0) continue;
+                const k = line.slice(0, eq).trim();
+                let v = line.slice(eq + 1).trim();
+                v = v.replace(/\s+#.*$/, '').trim();   // strip inline comment
+                if (process.env[k] === undefined || process.env[k] === '') {
+                    process.env[k] = v;
+                }
+            }
+        }
+    } catch { /* best-effort */ }
+})();
 
 const BACKEND_DEFS = {
     kimi: {

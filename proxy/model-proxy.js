@@ -214,6 +214,24 @@ export async function startProxy(opts) {
             return;
         }
 
+        // Loopback-only shutdown. macOS runs the proxy as root (to bind
+        // :443), so the non-root launcher can't `kill` it on exit. It
+        // instead POSTs here over 127.0.0.1 to ask the proxy to exit.
+        if (path === '/_proxy/shutdown') {
+            const ra = req.socket && req.socket.remoteAddress || '';
+            const isLoopback = ra === '127.0.0.1' || ra === '::1' || ra === '::ffff:127.0.0.1';
+            if (!isLoopback) {
+                res.writeHead(403, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ error: 'shutdown allowed from loopback only' }));
+                return;
+            }
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+            console.error('[deepantigravity] shutdown requested via /_proxy/shutdown — exiting');
+            setTimeout(() => process.exit(0), 50);
+            return;
+        }
+
         const body = await readBody(req);
         if (debug) saveDebugRequest(debugDir, req.method, path, body);
 

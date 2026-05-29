@@ -32,6 +32,16 @@ done
 SCRIPT_DIR="$(cd -P "$(dirname "$_SOURCE")" && pwd)"
 unset _SOURCE _DIR
 
+# ── OS detection ──
+# macOS lacks bwrap / setcap / getcap / getent / fuser / flock, so it
+# uses a different launch path (single shared proxy on 127.0.0.1:443,
+# run via sudo). Linux keeps the bwrap-per-backend path.
+case "$(uname -s)" in
+    Darwin) DAG_OS="macos" ;;
+    Linux)  DAG_OS="linux" ;;
+    *)      DAG_OS="linux" ;;
+esac
+
 HELPER_INSTALLED="/usr/local/bin/deepantigravity-helper"
 HELPER_SOURCE="$SCRIPT_DIR/proxy/deepantigravity-helper.sh"
 SUDOERS_FILE="/etc/sudoers.d/deepantigravity"
@@ -74,6 +84,17 @@ CA_BUNDLE_PATH="$SCRIPT_DIR/proxy/.cache/ca-bundle.pem"
 JOINED_BACKEND=""    # set to backend name once we register as a member
 TMP_HOSTS_FILE=""    # per-session /etc/hosts file, bind-mounted by bwrap
 
+# ── macOS shared-session state (single global proxy on 127.0.0.1:443) ──
+# macOS can't isolate /etc/hosts per process, so all terminals share one
+# proxy and one backend. State lives in proxy/.cache/macos-session/.
+MAC_SESSION_DIR="$SCRIPT_DIR/proxy/.cache/macos-session"
+MAC_LOCK="$MAC_SESSION_DIR/lock"
+MAC_PID_FILE="$MAC_SESSION_DIR/proxy.pid"
+MAC_BACKEND_FILE="$MAC_SESSION_DIR/backend"
+MAC_LOG_FILE="$MAC_SESSION_DIR/proxy.log"
+MAC_MEMBERS_DIR="$MAC_SESSION_DIR/members"
+MAC_JOINED=0         # 1 once this PID is a registered member
+
 # ── Parse args ──
 PASS_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -99,7 +120,13 @@ mask_key() {
 real_node() {
     local n
     n="$(command -v node 2>/dev/null)" || return 1
-    readlink -f "$n"
+    # Linux: resolve symlinks with readlink -f. macOS (BSD readlink) has
+    # no -f, and we don't need a fully-resolved path there anyway.
+    if [[ "$DAG_OS" == "macos" ]]; then
+        echo "$n"
+    else
+        readlink -f "$n"
+    fi
 }
 
 helper_installed() {
@@ -200,8 +227,34 @@ backend_session_leave() {
     } 9>"$(backend_lock "$backend")"
 }
 
+# macOS: drop our member file; if last-out, shut down the root proxy
+# (via loopback HTTP, no sudo needed) and remove the /etc/hosts hijack.
+mac_session_leave() {
+    [[ "$MAC_JOINED" -eq 1 ]] || return 0
+    mac_lock_acquire || { rm -f "$MAC_MEMBERS_DIR/$$" 2>/dev/null || true; return 0; }
+    rm -f "$MAC_MEMBERS_DIR/$$"
+    local active; active="$(mac_active_count)"
+    if [[ "$active" -gt 0 ]]; then mac_lock_release; return 0; fi
+    # Last out — tell the proxy to exit, then remove the hosts hijack.
+    curl -s -m 3 --cacert "$CA_BUNDLE_PATH" \
+        --resolve "cloudcode-pa.googleapis.com:$DEEPANTIGRAVITY_PORT:127.0.0.1" \
+        -X POST "https://cloudcode-pa.googleapis.com:$DEEPANTIGRAVITY_PORT/_proxy/shutdown" \
+        >/dev/null 2>&1 || true
+    sudo -n "$HELPER_INSTALLED" remove 2>/dev/null || true
+    if [[ "${DEEPANTIGRAVITY_DEBUG:-}" == "1" ]]; then
+        cp "$MAC_LOG_FILE" "$SCRIPT_DIR/proxy/.cache/last-proxy-macos.log" 2>/dev/null || true
+    fi
+    rm -rf "$MAC_SESSION_DIR"
+    mac_lock_release
+}
+
 # Cleanup runs on EVERY exit.
 cleanup_on_exit() {
+    if [[ "$DAG_OS" == "macos" ]]; then
+        mac_session_leave
+        MAC_JOINED=0
+        return
+    fi
     if [[ -n "$JOINED_BACKEND" ]]; then
         backend_session_leave "$JOINED_BACKEND"
         JOINED_BACKEND=""
@@ -222,9 +275,81 @@ canonicalize_backend() {
 }
 
 # ────────────────────────────────────────────────────────────────
+# --setup (macOS)
+# ────────────────────────────────────────────────────────────────
+do_setup_macos() {
+    local node_bin
+    if ! node_bin="$(real_node)"; then
+        echo "ERROR: node not found on PATH. Install Node.js >= 18 first." >&2
+        exit 1
+    fi
+    if [[ ! -f "$HELPER_SOURCE" ]]; then
+        echo "ERROR: helper script missing at $HELPER_SOURCE" >&2
+        exit 1
+    fi
+    local user; user="$(whoami)"
+
+    echo ""
+    echo "  deepantigravity — one-time setup (macOS)"
+    echo "  ========================================"
+    echo "  macOS has no bwrap/setcap, so the proxy runs via sudo and"
+    echo "  binds 127.0.0.1:443. This installs (sudo password ONCE):"
+    echo "    1. /usr/local/bin/deepantigravity-helper  (edits /etc/hosts)"
+    echo "    2. /etc/sudoers.d/deepantigravity         (NOPASSWD: helper + node proxy)"
+    echo ""
+    echo "  Multiple terminals using the SAME backend share one proxy."
+    echo "  Different backends in parallel are NOT supported on macOS."
+    echo ""
+
+    # CA + npm deps (no sudo)
+    cd "$SCRIPT_DIR/proxy"
+    if [[ ! -d node_modules/node-forge ]]; then
+        echo "  Installing proxy dependencies (no sudo)..."
+        npm install --silent --no-audit --no-fund || {
+            echo "ERROR: npm install failed. Run 'cd proxy && npm install'." >&2
+            exit 1
+        }
+    fi
+    node cert.js > /dev/null
+
+    echo "  Authenticating with sudo..."
+    sudo -v
+
+    # Install helper (root-owned)
+    echo "  Installing helper..."
+    sudo install -o root -g wheel -m 0755 "$HELPER_SOURCE" "$HELPER_INSTALLED"
+
+    # Sudoers rule: allow the hosts helper AND running the proxy as root
+    # without a password. The proxy must run as root to bind :443 (macOS
+    # has no setcap). node is allowed ONLY with our start-proxy.js script.
+    echo "  Installing sudoers rule..."
+    local sudoers_content="# Generated by deepantigravity --setup (macOS). Removed by --teardown.
+$user ALL=(root) NOPASSWD: $HELPER_INSTALLED add, $HELPER_INSTALLED remove
+$user ALL=(root) NOPASSWD: $node_bin $SCRIPT_DIR/proxy/start-proxy.js *"
+    local tmp; tmp=$(mktemp /tmp/dag-sudoers-XXXXXX)
+    echo "$sudoers_content" > "$tmp"
+    if ! sudo visudo -c -f "$tmp" >/dev/null 2>&1; then
+        echo "ERROR: generated sudoers content is invalid:" >&2
+        cat "$tmp" >&2
+        rm -f "$tmp"
+        exit 1
+    fi
+    sudo install -o root -g wheel -m 0440 "$tmp" "$SUDOERS_FILE"
+    rm -f "$tmp"
+
+    echo ""
+    echo "  ✓ Setup complete. Try:"
+    echo "      deepantigravity -b kimi      # routes through our proxy"
+    echo "      deepantigravity -b nv        # via Nvidia NIM"
+    echo "      agy                          # works normally (real Gemini)"
+    echo ""
+}
+
+# ────────────────────────────────────────────────────────────────
 # --setup
 # ────────────────────────────────────────────────────────────────
 do_setup() {
+    if [[ "$DAG_OS" == "macos" ]]; then do_setup_macos; return; fi
     local node_bin
     if ! node_bin="$(real_node)"; then
         echo "ERROR: node not found on PATH. Install Node.js >= 18 first." >&2
@@ -322,6 +447,22 @@ do_teardown() {
     echo "  deepantigravity — teardown"
     echo "  =========================="
 
+    # macOS: stop the shared root proxy + clean its session dir.
+    if [[ "$DAG_OS" == "macos" ]]; then
+        if [[ -d "$MAC_SESSION_DIR" ]]; then
+            echo "  Stopping macOS shared proxy..."
+            curl -s -m 3 --cacert "$CA_BUNDLE_PATH" \
+                --resolve "cloudcode-pa.googleapis.com:$DEEPANTIGRAVITY_PORT:127.0.0.1" \
+                -X POST "https://cloudcode-pa.googleapis.com:$DEEPANTIGRAVITY_PORT/_proxy/shutdown" \
+                >/dev/null 2>&1 || true
+            # Fallback: kill whatever roots are listening on :443.
+            local lp; lp="$(lsof -ti "tcp@127.0.0.1:$DEEPANTIGRAVITY_PORT" -s TCP:LISTEN 2>/dev/null | head -1)"
+            [[ -n "$lp" ]] && sudo kill -9 "$lp" 2>/dev/null || true
+            rm -rf "$MAC_SESSION_DIR"
+            echo "  ✓ Proxy stopped, session cleaned"
+        fi
+    fi
+
     # Kill any running per-backend proxies
     if [[ -d "$SESSIONS_ROOT" ]]; then
         echo "  Stopping any running backend proxies..."
@@ -380,7 +521,50 @@ do_teardown() {
 # ────────────────────────────────────────────────────────────────
 # --status
 # ────────────────────────────────────────────────────────────────
+show_status_macos() {
+    echo ""
+    echo "  deepantigravity — Status (macOS)"
+    echo "  ================================"
+    echo ""
+    echo "  agy:                 $(command -v agy 2>/dev/null || echo 'NOT FOUND — install from https://antigravity.google/download')"
+    echo "  node:                $(command -v node 2>/dev/null || echo 'NOT FOUND')"
+    echo ""
+    echo "  Setup state:"
+    echo "    Helper:            $(helper_installed && echo "✓ $HELPER_INSTALLED" || echo "✗ missing (run --setup)")"
+    echo "    Sudoers rule:      $(sudoers_installed && echo "✓ $SUDOERS_FILE" || echo "✗ missing (run --setup)")"
+    echo "    CA cert:           $([[ -f "$SCRIPT_DIR/proxy/.cache/ca.pem" ]] && echo "✓ $SCRIPT_DIR/proxy/.cache/ca.pem" || echo "✗ not yet generated")"
+    echo ""
+    echo "  Live state:"
+    echo "    /etc/hosts:        $(hosts_present && echo "PRESENT (a session is live, or cleanup failed → --teardown)" || echo "clean (correct — agy alone uses real Google)")"
+    if [[ -f "$MAC_PID_FILE" ]]; then
+        local pp be
+        pp="$(cat "$MAC_PID_FILE" 2>/dev/null || true)"
+        be="$(cat "$MAC_BACKEND_FILE" 2>/dev/null || true)"
+        if [[ -n "$pp" && "$pp" != "unknown" ]] && kill -0 "$pp" 2>/dev/null; then
+            echo "    Shared proxy:      PID $pp (backend: ${be:-unknown})"
+            echo "    Active sessions:   $(mac_active_count)"
+        elif lsof -ti "tcp@127.0.0.1:$DEEPANTIGRAVITY_PORT" -s TCP:LISTEN >/dev/null 2>&1; then
+            echo "    Shared proxy:      running on 127.0.0.1:$DEEPANTIGRAVITY_PORT (backend: ${be:-unknown})"
+            echo "    Active sessions:   $(mac_active_count)"
+        else
+            echo "    Shared proxy:      none (state stale, will be cleaned on next launch)"
+        fi
+    else
+        echo "    Shared proxy:      none"
+    fi
+    echo ""
+    echo "  Keys:"
+    echo "    KIMI_API_KEY:      $(mask_key "${KIMI_API_KEY:-}")"
+    echo "    NVIDIA_API_KEY:    $(mask_key "${NVIDIA_API_KEY:-}")"
+    echo ""
+    echo "  Default backend:    $DEFAULT_BACKEND"
+    echo "  Proxy port:         $DEEPANTIGRAVITY_PORT"
+    echo "  Note: macOS shares ONE proxy/backend across terminals."
+    echo ""
+}
+
 show_status() {
+    if [[ "$DAG_OS" == "macos" ]]; then show_status_macos; return; fi
     local node_bin
     node_bin="$(real_node 2>/dev/null || echo 'NOT FOUND')"
     echo ""
@@ -573,9 +757,178 @@ free_port() {
 }
 
 # ────────────────────────────────────────────────────────────────
+# Main launch path (macOS) — single shared proxy on 127.0.0.1:443
+# ────────────────────────────────────────────────────────────────
+# macOS has no bwrap, so we can't give each terminal its own /etc/hosts.
+# Instead all terminals share ONE proxy + ONE backend (refcounted). The
+# proxy runs as root (to bind :443) via the NOPASSWD sudoers rule; the
+# global /etc/hosts redirect is added by the helper while a session is
+# live and removed when the last terminal exits. Different backends in
+# parallel are refused. Locking uses mkdir (flock is unavailable on macOS).
+mac_lock_acquire() {
+    local n=0
+    while ! mkdir "$MAC_LOCK" 2>/dev/null; do
+        # Steal a stale lock whose owner PID is dead.
+        local owner; owner="$(cat "$MAC_LOCK/owner" 2>/dev/null || true)"
+        if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -rf "$MAC_LOCK" 2>/dev/null || true
+            continue
+        fi
+        n=$((n + 1)); [[ $n -gt 100 ]] && return 1
+        sleep 0.1
+    done
+    echo "$$" > "$MAC_LOCK/owner"
+    return 0
+}
+mac_lock_release() { rm -rf "$MAC_LOCK" 2>/dev/null || true; }
+
+mac_active_count() {
+    local count=0
+    if [[ -d "$MAC_MEMBERS_DIR" ]]; then
+        for f in "$MAC_MEMBERS_DIR"/*; do
+            [[ -e "$f" ]] || continue
+            local pid; pid="$(basename "$f")"
+            if kill -0 "$pid" 2>/dev/null; then count=$((count + 1)); else rm -f "$f"; fi
+        done
+    fi
+    echo "$count"
+}
+
+launch_agy_macos() {
+    if ! helper_installed || ! sudoers_installed; then
+        echo "ERROR: setup not complete. Run: $0 --setup" >&2
+        exit 1
+    fi
+    ensure_node_modules
+    mkdir -p "$MAC_SESSION_DIR" "$MAC_MEMBERS_DIR"
+
+    local backend="$RESOLVED_BACKEND"
+    local node_bin; node_bin="$(real_node)"
+
+    if ! mac_lock_acquire; then
+        echo "ERROR: could not acquire session lock (another launcher hung?)." >&2
+        exit 1
+    fi
+
+    local existing_pid="" existing_backend=""
+    [[ -f "$MAC_PID_FILE" ]]     && existing_pid="$(cat "$MAC_PID_FILE" 2>/dev/null || true)"
+    [[ -f "$MAC_BACKEND_FILE" ]] && existing_backend="$(cat "$MAC_BACKEND_FILE" 2>/dev/null || true)"
+
+    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+        if [[ "$existing_backend" == "$backend" ]]; then
+            # JOIN
+            touch "$MAC_MEMBERS_DIR/$$"; MAC_JOINED=1
+            local n; n="$(mac_active_count)"
+            echo "  Joined $backend session: proxy PID $existing_pid on 127.0.0.1:$DEEPANTIGRAVITY_PORT ($n session(s) active)"
+            mac_lock_release
+        else
+            # REFUSE different backend
+            local n; n="$(mac_active_count)"
+            mac_lock_release
+            echo "ERROR: a deepantigravity session is already running with a DIFFERENT backend" >&2
+            echo "  Running backend: $existing_backend  (proxy PID $existing_pid, $n session(s))" >&2
+            echo "  Requested:       $backend" >&2
+            echo "" >&2
+            echo "  macOS shares one global proxy, so all terminals must use the same" >&2
+            echo "  backend. Re-run with -b $existing_backend, or stop the other session(s)." >&2
+            exit 1
+        fi
+    else
+        # START fresh — become the leader.
+        rm -f "$MAC_PID_FILE" "$MAC_BACKEND_FILE" "$MAC_LOG_FILE"
+        rm -rf "$MAC_MEMBERS_DIR"; mkdir -p "$MAC_MEMBERS_DIR"
+
+        # Clean any stale global hijack from a crashed session.
+        if hosts_present; then
+            echo "  Cleaning stale /etc/hosts entries..."
+            sudo -n "$HELPER_INSTALLED" remove 2>/dev/null || true
+        fi
+
+        # Resolve real Google IPs BEFORE hijacking (dig bypasses /etc/hosts).
+        local cloudcode_ip="" daily_ip=""
+        cloudcode_ip="$(dig +short cloudcode-pa.googleapis.com A 2>/dev/null | grep -m1 '^[0-9]')"
+        daily_ip="$(dig +short daily-cloudcode-pa.googleapis.com A 2>/dev/null | grep -m1 '^[0-9]')"
+        if [[ -z "$cloudcode_ip" ]]; then
+            echo "ERROR: could not resolve cloudcode-pa.googleapis.com (dig). Is the network up?" >&2
+            mac_lock_release; exit 1
+        fi
+        [[ -z "$daily_ip" ]] && daily_ip="$cloudcode_ip"
+        echo "  Real IPs: cloudcode-pa → $cloudcode_ip, daily-cloudcode-pa → $daily_ip"
+
+        echo "  Adding /etc/hosts redirect for cloudcode-pa.googleapis.com..."
+        if ! sudo -n "$HELPER_INSTALLED" add 2>/dev/null; then
+            echo "ERROR: passwordless sudo for the helper failed. Run --setup again." >&2
+            mac_lock_release; exit 1
+        fi
+
+        : > "$MAC_LOG_FILE"
+        echo "  Starting $backend proxy on 127.0.0.1:$DEEPANTIGRAVITY_PORT (via sudo) ..."
+        # Proxy must run as root to bind :443. It reads keys from
+        # proxy/.env itself and resolves real Google IPs via its own
+        # DNS (macOS c-ares bypasses /etc/hosts). We pass the resolved
+        # IPs through a tiny env file the proxy also reads, to be safe.
+        printf 'DEEPANTIGRAVITY_REAL_IP_CLOUDCODE=%s\nDEEPANTIGRAVITY_REAL_IP_DAILY=%s\n' \
+            "$cloudcode_ip" "$daily_ip" > "$MAC_SESSION_DIR/proxy.env"
+        # The sudoers rule allows exactly: node start-proxy.js *
+        DEEPANTIGRAVITY_DEBUG="${DEEPANTIGRAVITY_DEBUG:-}" \
+        sudo -n "$node_bin" "$SCRIPT_DIR/proxy/start-proxy.js" \
+            "$backend" "$DEEPANTIGRAVITY_PORT" "127.0.0.1" \
+            > "$MAC_LOG_FILE" 2>&1 &
+        disown 2>/dev/null || true
+
+        # Wait for the proxy to print its port line.
+        local tries=0 proxy_port="" ca_path=""
+        while [[ $tries -lt 80 ]]; do
+            if [[ -s "$MAC_LOG_FILE" ]] && grep -q '^[0-9]\+$' "$MAC_LOG_FILE" 2>/dev/null; then break; fi
+            sleep 0.1; tries=$((tries + 1))
+        done
+        proxy_port="$(grep -m1 '^[0-9]\+$' "$MAC_LOG_FILE" || true)"
+        ca_path="$(grep -m1 '^/' "$MAC_LOG_FILE" || true)"
+        if [[ -z "$proxy_port" || -z "$ca_path" || ! -f "$ca_path" ]]; then
+            echo "ERROR: proxy failed to start. Log:" >&2
+            tail -20 "$MAC_LOG_FILE" >&2 2>/dev/null || true
+            sudo -n "$HELPER_INSTALLED" remove 2>/dev/null || true
+            mac_lock_release; exit 1
+        fi
+
+        # Find the root-owned proxy PID by its listening socket (we can't
+        # use $! — that's sudo's child shell, not necessarily node).
+        local proxy_pid=""
+        proxy_pid="$(lsof -ti "tcp@127.0.0.1:$DEEPANTIGRAVITY_PORT" -s TCP:LISTEN 2>/dev/null | head -1)"
+        echo "${proxy_pid:-unknown}" > "$MAC_PID_FILE"
+        echo "$backend" > "$MAC_BACKEND_FILE"
+        touch "$MAC_MEMBERS_DIR/$$"; MAC_JOINED=1
+        echo "  TLS server on 127.0.0.1:$proxy_port → $backend"
+        mac_lock_release
+    fi
+
+    # Build combined CA bundle: our CA + macOS system roots (exported
+    # from the System keychain). Go's SSL_CERT_FILE REPLACES the trust
+    # pool, so non-cloudcode-pa TLS needs the real roots too.
+    local our_ca="$SCRIPT_DIR/proxy/.cache/ca.pem"
+    {
+        cat "$our_ca"
+        security find-certificate -a -p \
+            /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null || true
+        security find-certificate -a -p \
+            /Library/Keychains/System.keychain 2>/dev/null || true
+    } > "$CA_BUNDLE_PATH"
+    export SSL_CERT_FILE="$CA_BUNDLE_PATH"
+    export SSL_CERT_DIR="$(dirname "$CA_BUNDLE_PATH")"
+
+    echo ""
+    set +e
+    agy "${PASS_ARGS[@]}"
+    local agy_status=$?
+    set -e
+    return $agy_status
+}
+
+# ────────────────────────────────────────────────────────────────
 # Main launch path
 # ────────────────────────────────────────────────────────────────
 launch_agy() {
+    if [[ "$DAG_OS" == "macos" ]]; then launch_agy_macos; return; fi
     # Pre-flight
     if ! node_has_bind_cap; then
         echo "ERROR: node lacks CAP_NET_BIND_SERVICE. Run: $0 --setup" >&2
