@@ -139,6 +139,10 @@ export async function startProxy(opts) {
     let totalErrors     = 0;
     let inputTokens     = 0;
     let outputTokens    = 0;
+    // PROOF tracker: the last model name the UPSTREAM SERVER reported.
+    // Populated by forwardOpenAI/forwardAnthropic via opts._setLastModel.
+    let lastUpstreamModel = null;
+    opts._setLastModel = (m) => { if (m) lastUpstreamModel = m; };
 
     const handleRequest = async (req, res, sniHost) => {
         const path = req.url || '';
@@ -151,6 +155,7 @@ export async function startProxy(opts) {
                 backend: opts.backend,
                 upstreamUrl: opts.upstreamUrl,
                 targetModel: opts.targetModel,
+                lastUpstreamModel,
                 totalRequests, totalTranslated, totalForwarded, totalErrors,
                 inputTokens, outputTokens,
             }, null, 2));
@@ -367,7 +372,20 @@ async function forwardAnthropic(res, anthBody, opts, geminiModel, onUsage) {
         });
         const tx = new AnthropicToGeminiStream({ originalGeminiModel: geminiModel });
         let inBytes = 0, outBytes = 0, outChunks = 0;
-        upRes.on('data', (c) => { inBytes += c.length; });
+        // PROOF: sniff the model Kimi reports in its message_start event.
+        let sniffed = false, sniffBuf = '';
+        upRes.on('data', (c) => {
+            inBytes += c.length;
+            if (sniffed) return;
+            sniffBuf += c.toString();
+            const m = sniffBuf.match(/"model"\s*:\s*"([^"]+)"/);
+            if (m) {
+                sniffed = true;
+                console.error(`[deepantigravity]     ✓ UPSTREAM SERVER REPORTS model="${m[1]}"  (host=${upstreamUrl.hostname}, requested=${opts.targetModel})`);
+                if (opts._setLastModel) opts._setLastModel(m[1]);
+            }
+            if (sniffBuf.length > 65536) sniffed = true;
+        });
         // Tee outgoing chunks to a debug file for inspection
         let debugFd = null;
         if (process.env.DEEPANTIGRAVITY_DEBUG === '1') {
@@ -450,6 +468,22 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
         });
         const oa2anth = new OpenAIToAnthropicStream(opts.targetModel);
         const anth2gem = new AnthropicToGeminiStream({ originalGeminiModel: geminiModel });
+        // PROOF: sniff the model the upstream server reports in its SSE
+        // chunks and log it once. This is server-authoritative evidence
+        // of which backend actually served the response.
+        let sniffed = false;
+        let sniffBuf = '';
+        upRes.on('data', (c) => {
+            if (sniffed) return;
+            sniffBuf += c.toString();
+            const m = sniffBuf.match(/"model"\s*:\s*"([^"]+)"/);
+            if (m) {
+                sniffed = true;
+                console.error(`[deepantigravity]     ✓ UPSTREAM SERVER REPORTS model="${m[1]}"  (host=${upstreamUrl.hostname}, requested=${opts.targetModel})`);
+                if (opts._setLastModel) opts._setLastModel(m[1]);
+            }
+            if (sniffBuf.length > 65536) sniffed = true; // stop buffering
+        });
         upRes.pipe(oa2anth).pipe(anth2gem).pipe(res);
     });
 

@@ -417,6 +417,13 @@ export class OpenAIToAnthropicStream extends Transform {
         // Emit message_start on first chunk
         if (!this._started && !this._finished) {
             this._started = true;
+            // PROOF: prefer the model the UPSTREAM SERVER echoes back
+            // (parsed.model) over the model we requested. Nvidia/OpenAI-
+            // compat servers return the real model id they served in
+            // every chunk's `model` field — this is server-authoritative
+            // evidence of which backend actually answered.
+            const upstreamModel = parsed.model || this._requestModel || 'unknown';
+            this._upstreamModel = upstreamModel;
             this._emitEvent('message_start', {
                 type: 'message_start',
                 message: {
@@ -424,7 +431,7 @@ export class OpenAIToAnthropicStream extends Transform {
                     type: 'message',
                     role: 'assistant',
                     content: [],
-                    model: this._requestModel || parsed.model || 'unknown',
+                    model: upstreamModel,
                     stop_reason: null,
                     stop_sequence: null,
                     usage: { input_tokens: 0, output_tokens: 0 },

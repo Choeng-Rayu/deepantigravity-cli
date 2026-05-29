@@ -192,6 +192,10 @@ backend_session_leave() {
                 kill -9 "$pp" 2>/dev/null || true
             fi
         fi
+        # Under DEBUG, keep the proxy log for post-mortem proof inspection.
+        if [[ "${DEEPANTIGRAVITY_DEBUG:-}" == "1" ]]; then
+            cp "$(backend_log_file "$backend")" "$SCRIPT_DIR/proxy/.cache/last-proxy-$backend.log" 2>/dev/null || true
+        fi
         rm -rf "$bdir"
     } 9>"$(backend_lock "$backend")"
 }

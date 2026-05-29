@@ -377,6 +377,15 @@ export class AnthropicToGeminiStream extends Transform {
                     this._inputTokens = data.message.usage.input_tokens || 0;
                     this._outputTokens = data.message.usage.output_tokens || 0;
                 }
+                // PROOF OF BACKEND: the upstream (Kimi / Nvidia) echoes the
+                // real model name it served in `message.model`. We surface
+                // it as Gemini's `modelVersion` so `agy` displays the
+                // ACTUAL model (e.g. "stepfun-ai/step-3.7-flash") instead
+                // of the Gemini name agy requested. This is how you can
+                // verify the response really came from the chosen backend.
+                if (data.message?.model) {
+                    this._modelVersion = data.message.model;
+                }
                 break;
             }
             case 'content_block_start': {
