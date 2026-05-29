@@ -70,6 +70,58 @@ const TRANSLATED_PATHS = [
     '/v1internal:internalAtomicAgenticChat',
 ];
 
+// ── Phase 2: selectable backend models in agy's /model picker ──
+// We inject extra entries into the fetchAvailableModels map, one per
+// model in this list. agy sends the map KEY back in streamGenerateContent,
+// so we prefix keys with DEEPANTIGRAVITY_KEY_PREFIX to recognise + route
+// them to the specific upstream model.
+const DEEPANTIGRAVITY_KEY_PREFIX = 'dag-';
+
+// Default curated Nvidia coding models. Override via NVIDIA_MODELS in
+// proxy/.env (comma-separated upstream model ids).
+const DEFAULT_NVIDIA_MODELS = [
+    'openai/gpt-oss-120b',
+    'openai/gpt-oss-20b',
+    'qwen/qwen3-coder-480b-a35b-instruct',
+    'deepseek-ai/deepseek-v4-pro',
+    'moonshotai/kimi-k2.6',
+    'stepfun-ai/step-3.7-flash',
+    'meta/llama-3.3-70b-instruct',
+    'nvidia/llama-3.3-nemotron-super-49b-v1.5',
+];
+
+// Map an upstream model id to a stable agy map key (alnum + dash only).
+function modelToKey(modelId) {
+    return DEEPANTIGRAVITY_KEY_PREFIX + modelId.replace(/[^a-zA-Z0-9]+/g, '-');
+}
+
+// Strip a leading "models/" prefix agy sometimes prepends to the key.
+function stripModelsPrefix(name) {
+    return String(name || '').replace(/^models\//, '');
+}
+
+// Reverse: given a map key agy sent back, return the upstream model id
+// (or null if it isn't one of ours). Built from the configured list.
+function keyToModel(key, modelList) {
+    for (const m of modelList) {
+        if (modelToKey(m) === key) return m;
+    }
+    return null;
+}
+
+// The selectable model list for the active backend (nvidia only for now).
+function selectableModels(opts) {
+    if (opts.backend !== 'nvidia') return [];
+    const fromEnv = (process.env.NVIDIA_MODELS || '').split(',')
+        .map(s => s.trim()).filter(Boolean);
+    const list = fromEnv.length > 0 ? fromEnv : DEFAULT_NVIDIA_MODELS;
+    // Always include the configured default target so it's pickable too.
+    if (opts.targetModel && !list.includes(opts.targetModel)) {
+        list.unshift(opts.targetModel);
+    }
+    return list;
+}
+
 // Cache real IPs of upstream hosts. Populated from env vars set by the
 // launcher (which resolves them BEFORE adding /etc/hosts entries —
 // systemd-resolved serves /etc/hosts even for direct DNS queries, so
@@ -178,8 +230,15 @@ export async function startProxy(opts) {
             }
 
             // Everything else: forward transparently to real Google.
+            // EXCEPT fetchAvailableModels — we forward it, then rewrite
+            // the model display names so agy's `/model` picker shows the
+            // ACTUAL backend model the user is routed to.
             totalForwarded++;
-            await forwardToRealGoogle(req, res, body, upstreamHost);
+            if (path.startsWith('/v1internal:fetchAvailableModels')) {
+                await forwardAndRewriteModels(req, res, body, upstreamHost, opts);
+            } else {
+                await forwardToRealGoogle(req, res, body, upstreamHost);
+            }
         } catch (e) {
             totalErrors++;
             console.error(`[deepantigravity] error handling ${path}:`, e.stack || e.message);
@@ -283,6 +342,127 @@ async function forwardToRealGoogle(req, res, body, upstreamHost) {
 
 
 // ════════════════════════════════════════════════════════════════
+// fetchAvailableModels — forward to Google, then rewrite display names
+// so agy's `/model` picker shows the REAL backend model.
+// ════════════════════════════════════════════════════════════════
+async function forwardAndRewriteModels(req, res, body, upstreamHost, opts) {
+    const realIp = await getRealIp(upstreamHost);
+
+    const fwdHeaders = { ...req.headers };
+    delete fwdHeaders['host'];
+    delete fwdHeaders['connection'];
+    delete fwdHeaders['proxy-connection'];
+    delete fwdHeaders['accept-encoding'];   // ask for identity so we can parse JSON
+    fwdHeaders.host = upstreamHost;
+    fwdHeaders['accept-encoding'] = 'identity';
+    if (body && body.length) fwdHeaders['content-length'] = String(body.length);
+
+    const upstream = httpsRequest({
+        host: realIp,
+        port: 443,
+        method: req.method,
+        path: req.url,
+        headers: fwdHeaders,
+        servername: upstreamHost,
+        timeout: REQUEST_TIMEOUT_MS,
+    }, (upRes) => {
+        const chunks = [];
+        upRes.on('data', (c) => chunks.push(c));
+        upRes.on('end', () => {
+            let buf = Buffer.concat(chunks);
+            const respHeaders = { ...upRes.headers };
+            delete respHeaders['transfer-encoding'];
+            delete respHeaders['content-encoding'];
+            delete respHeaders['content-length'];
+
+            // Only rewrite a 200 JSON body; otherwise pass through.
+            if (upRes.statusCode === 200) {
+                try {
+                    const json = JSON.parse(buf.toString('utf8'));
+                    const models = json.models;
+                    const list = selectableModels(opts);
+                    if (process.env.DEEPANTIGRAVITY_DEBUG === '1') {
+                        try {
+                            const did = json.defaultAgentModelId;
+                            require('fs').writeFileSync(
+                                require('path').join(__dirname, '.cache', 'real-agent-entry.json'),
+                                JSON.stringify({ defaultAgentModelId: did, entry: models[did] }, null, 2));
+                        } catch {}
+                    }
+                    if (models && typeof models === 'object' && list.length > 0) {
+                        // Clone the DEFAULT AGENT model entry as the template.
+                        // It carries the modelExperiments (system prompts,
+                        // checkpointer config) that agy REQUIRES to run an
+                        // agentic turn. Using an arbitrary entry (or stripping
+                        // modelExperiments) makes agy abort with "Agent
+                        // execution terminated due to error".
+                        const did = json.defaultAgentModelId;
+                        let template = (did && models[did]) ? models[did] : null;
+                        if (!template) {
+                            // Fall back to any entry that has modelExperiments.
+                            for (const v of Object.values(models)) {
+                                if (v && typeof v === 'object' && v.modelExperiments) { template = v; break; }
+                            }
+                        }
+                        // Inject one entry per selectable upstream model.
+                        const injectedKeys = [];
+                        for (const modelId of list) {
+                            const key = modelToKey(modelId);
+                            const entry = template ? JSON.parse(JSON.stringify(template)) : {};
+                            // Override ONLY the user-facing name. Keep model
+                            // proto id, capabilities, and modelExperiments
+                            // exactly as the working agent model has them.
+                            entry.displayName = `★ ${modelId}  (${opts.backend})`;
+                            entry.recommended = false;
+                            delete entry.tagTitle;
+                            delete entry.tagDescription;
+                            models[key] = entry;
+                            injectedKeys.push(key);
+                        }
+                        // The picker reads agentModelSorts[].groups[].modelIds.
+                        // Add our keys there as a dedicated group so they show
+                        // up in the "Switch Model" list.
+                        if (!Array.isArray(json.agentModelSorts)) json.agentModelSorts = [];
+                        json.agentModelSorts.unshift({
+                            displayName: `${opts.backend} (deepantigravity)`,
+                            groups: [{ modelIds: injectedKeys }],
+                        });
+                        // Also append to every existing group so they appear
+                        // regardless of which sort agy renders.
+                        for (const sort of json.agentModelSorts) {
+                            for (const g of (sort.groups || [])) {
+                                if (Array.isArray(g.modelIds)) {
+                                    for (const k of injectedKeys) {
+                                        if (!g.modelIds.includes(k)) g.modelIds.push(k);
+                                    }
+                                }
+                            }
+                        }
+                        buf = Buffer.from(JSON.stringify(json), 'utf8');
+                        console.error(`[deepantigravity]     fetchAvailableModels: injected ${injectedKeys.length} ${opts.backend} model(s) into /model picker`);
+                    }
+                } catch (e) {
+                    console.error(`[deepantigravity]     fetchAvailableModels rewrite skipped: ${e.message}`);
+                }
+            }
+            respHeaders['content-length'] = String(buf.length);
+            res.writeHead(upRes.statusCode, upRes.statusMessage, respHeaders);
+            res.end(buf);
+        });
+    });
+
+    upstream.on('error', (e) => {
+        console.error(`[deepantigravity] fetchAvailableModels forward error (${realIp}): ${e.message}`);
+        if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { code: 502, message: e.message } }));
+    });
+
+    if (body && body.length) upstream.write(body);
+    upstream.end();
+}
+
+
+// ════════════════════════════════════════════════════════════════
 // streamGenerateContent — translation pipeline
 // ════════════════════════════════════════════════════════════════
 async function handleGenerate(req, res, bodyBuf, opts, onUsage) {
@@ -299,14 +479,25 @@ async function handleGenerate(req, res, bodyBuf, opts, onUsage) {
         || geminiBody.request?.model
         || 'gemini-2.5-pro';
 
+    // Phase 2: if agy sent one of OUR injected model keys (the user
+    // picked a specific backend model via /model), route THIS request
+    // to that upstream model instead of the default targetModel.
+    const selected = keyToModel(stripModelsPrefix(originalGeminiModel), selectableModels(opts));
+    const effectiveOpts = selected
+        ? { ...opts, targetModel: selected }
+        : opts;
+    if (selected) {
+        console.error(`[deepantigravity]     /model selection: ${originalGeminiModel} → upstream ${selected}`);
+    }
+
     console.error(`[deepantigravity] >>> streamGenerateContent: model=${originalGeminiModel}, ` +
         `contents=${geminiBody.request?.contents?.length || 0}, ` +
         `tools=${geminiBody.request?.tools?.length || 0}`);
 
     let anthBody;
     try {
-        anthBody = geminiToAnthropic(geminiBody, opts.targetModel);
-        console.error(`[deepantigravity]     translated → ${opts.backend}: ` +
+        anthBody = geminiToAnthropic(geminiBody, effectiveOpts.targetModel);
+        console.error(`[deepantigravity]     translated → ${effectiveOpts.backend}: ` +
             `model=${anthBody.model}, messages=${anthBody.messages?.length || 0}, ` +
             `tools=${anthBody.tools?.length || 0}, max_tokens=${anthBody.max_tokens}`);
     } catch (e) {
@@ -316,13 +507,13 @@ async function handleGenerate(req, res, bodyBuf, opts, onUsage) {
         return;
     }
 
-    if (ANTHROPIC_NATIVE.has(opts.backend)) {
-        await forwardAnthropic(res, anthBody, opts, originalGeminiModel, onUsage);
-    } else if (OPENAI_COMPAT.has(opts.backend)) {
-        await forwardOpenAI(res, anthBody, opts, originalGeminiModel, onUsage);
+    if (ANTHROPIC_NATIVE.has(effectiveOpts.backend)) {
+        await forwardAnthropic(res, anthBody, effectiveOpts, originalGeminiModel, onUsage);
+    } else if (OPENAI_COMPAT.has(effectiveOpts.backend)) {
+        await forwardOpenAI(res, anthBody, effectiveOpts, originalGeminiModel, onUsage);
     } else {
         res.writeHead(500, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: { code: 500, message: `unsupported backend: ${opts.backend}` }}));
+        res.end(JSON.stringify({ error: { code: 500, message: `unsupported backend: ${effectiveOpts.backend}` }}));
     }
 }
 
