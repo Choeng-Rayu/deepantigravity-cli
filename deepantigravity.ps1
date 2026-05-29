@@ -111,7 +111,7 @@ function Test-Admin {
     # On non-Windows hosts (e.g. PowerShell Core on Linux), the
     # WindowsPrincipal API throws. Treat that as "not admin" so the
     # script can still display status / help without failing.
-    if ($IsLinux -or $IsMacOS) {
+    if ((Get-Variable IsLinux -ErrorAction SilentlyContinue) -and ($IsLinux -or $IsMacOS)) {
         # Linux/macOS proxy of "is admin" — true iff EUID == 0.
         try { return ((id -u 2>/dev/null) -eq '0') } catch { return $false }
     }
@@ -409,6 +409,19 @@ function Do-Setup {
     Write-Host ''
     Confirm-NodeModules
     & node (Join-Path $ScriptDir 'proxy\cert.js') | Out-Null
+
+    # Auto-import CA into Windows trust store
+    $caPemPath = Join-Path $ScriptDir 'proxy\.cache\ca.pem'
+    if (Test-Path $caPemPath) {
+        Write-Host '  Importing CA certificate into Windows trust store...'
+        try {
+            Import-Certificate -FilePath $caPemPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+            Write-Host '  ✓ CA certificate trusted by Windows.'
+        } catch {
+            Write-Warning 'Could not auto-import CA. Run manually: Import-Certificate -FilePath proxy\.cache\ca.pem -CertStoreLocation Cert:\LocalMachine\Root'
+        }
+    }
+
     Write-Host ''
     Write-Host '  ✓ Setup complete. Launch with:'
     Write-Host '      .\deepantigravity.ps1 -b kimi      # leader (admin needed)'
