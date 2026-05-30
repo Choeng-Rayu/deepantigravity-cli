@@ -1071,6 +1071,7 @@ async function forwardDeepSeekWeb(res, anthBody, opts, geminiModel, onUsage) {
             // streaming it, so we can extract <tool_call> markers at the end
             // and re-emit them as real functionCalls (emulated tool use).
             let contentBuf = '';
+            let thinkingBuf = '';
             const emitText = (t) => tx.write(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: t } })}\n\n`);
             const finish = () => {
                 if (done) return;
@@ -1103,6 +1104,17 @@ async function forwardDeepSeekWeb(res, anthBody, opts, geminiModel, onUsage) {
                         }
                         stopReason = 'tool_use';
                         dsToolLog(`[deepantigravity]     emulated tool_use: ${calls.map(c => c.name).join(', ')}`);
+                    } else if (!cleanedText) {
+                        // No tool calls AND no visible answer (the whole reply
+                        // went to the thinking channel). agy would print a
+                        // blank turn — fall back to the thinking text so the
+                        // user gets an answer.
+                        if (thinkingBuf.trim()) {
+                            emitText(thinkingBuf.trim());
+                            dsToolLog(`[deepantigravity]     [tools] empty content — surfaced ${thinkingBuf.length}b of thinking as the answer`);
+                        } else {
+                            dsToolLog(`[deepantigravity]     [tools] WARNING: empty content and empty thinking — blank turn`);
+                        }
                     }
                 }
                 tx.write(`data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: stopReason } })}\n\n`);
@@ -1119,6 +1131,7 @@ async function forwardDeepSeekWeb(res, anthBody, opts, geminiModel, onUsage) {
                     if (hasTools) contentBuf += v;          // buffer for marker parsing
                     else emitText(v);                        // stream directly
                 } else if (curPath === 'response/thinking_content' && typeof v === 'string') {
+                    if (hasTools) thinkingBuf += v;
                     tx.write(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: v } })}\n\n`);
                 } else if (curPath === 'response/status' && v === 'FINISHED') {
                     finish();
