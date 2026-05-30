@@ -155,6 +155,7 @@ hosts_present() {
 backend_ip() {
     case "$1" in
         kimi)   echo "127.0.10.1" ;;
+        deepseekOauthWeb) echo "127.0.30.1" ;;  # Unique IP for deepseekOauthWeb
         nvidia) echo "127.0.20.1" ;;
         *)      echo "127.0.0.1" ;;
     esac
@@ -268,9 +269,10 @@ trap cleanup_on_exit EXIT INT TERM
 
 canonicalize_backend() {
     case "$1" in
-        nv|nvidia)     echo "nvidia" ;;
-        kimi)          echo "kimi" ;;
-        *)             echo "$1" ;;
+        nv|nvidia)               echo "nvidia" ;;
+        ds|deepseek|deepseekOauthWeb) echo "deepseekOauthWeb" ;;
+        kimi)                    echo "kimi" ;;
+        *)                       echo "$1" ;;
     esac
 }
 
@@ -433,9 +435,10 @@ $user ALL=(root) NOPASSWD: $HELPER_INSTALLED add, $HELPER_INSTALLED remove"
 
     echo ""
     echo "  ✓ Setup complete. Try:"
-    echo "      deepantigravity -b kimi      # routes through our proxy"
-    echo "      deepantigravity -b nv        # via Nvidia NIM"
-    echo "      agy                          # works normally (real Gemini)"
+    echo "      deepantigravity -b kimi        # routes through our proxy"
+    echo "      deepantigravity -b deepseek    # via DeepSeek Web OAuth"
+    echo "      deepantigravity -b nv          # via Nvidia NIM"
+    echo "      agy                            # works normally (real Gemini)"
     echo ""
 }
 
@@ -554,8 +557,9 @@ show_status_macos() {
     fi
     echo ""
     echo "  Keys:"
-    echo "    KIMI_API_KEY:      $(mask_key "${KIMI_API_KEY:-}")"
-    echo "    NVIDIA_API_KEY:    $(mask_key "${NVIDIA_API_KEY:-}")"
+    echo "    KIMI_API_KEY:           $(mask_key "${KIMI_API_KEY:-}")"
+    echo "    DEEPSEEK_OAUTH_WEB_TOKEN: $(mask_key "${DEEPSEEK_OAUTH_WEB_TOKEN:-}")"
+    echo "    NVIDIA_API_KEY:         $(mask_key "${NVIDIA_API_KEY:-}")"
     echo ""
     echo "  Default backend:    $DEFAULT_BACKEND"
     echo "  Proxy port:         $DEEPANTIGRAVITY_PORT"
@@ -600,8 +604,9 @@ show_status() {
     [[ $found_any -eq 0 ]] && echo "    Active proxies:      none"
     echo ""
     echo "  Keys:"
-    echo "    KIMI_API_KEY:        $(mask_key "${KIMI_API_KEY:-}")"
-    echo "    NVIDIA_API_KEY:      $(mask_key "${NVIDIA_API_KEY:-}")"
+    echo "    KIMI_API_KEY:             $(mask_key "${KIMI_API_KEY:-}")"
+    echo "    DEEPSEEK_OAUTH_WEB_TOKEN: $(mask_key "${DEEPSEEK_OAUTH_WEB_TOKEN:-}")"
+    echo "    NVIDIA_API_KEY:           $(mask_key "${NVIDIA_API_KEY:-}")"
     echo ""
     echo "  Default backend:       $DEFAULT_BACKEND"
     echo "  Proxy port:            $DEEPANTIGRAVITY_PORT"
@@ -617,10 +622,11 @@ show_cost() {
   deepantigravity Provider Pricing
   =================================
 
-  Provider        Input/M    Output/M   Notes
-  ----------      --------   --------   -----------
-  Kimi Code       subscription          Anthropic-native, kimi-for-coding
-  Nvidia NIM      \$0.44      \$0.87      OpenAI-compat (default kimi-k2.6)
+  Provider           Input/M    Output/M   Notes
+  ----------         --------   --------   -----------
+  Kimi Code          subscription          Anthropic-native, kimi-for-coding
+  DeepSeek Web OAuth free                 Anthropic-native, deepseek-v4-flash / deepseek-v4-pro
+  Nvidia NIM         \$0.44      \$0.87      OpenAI-compat (default kimi-k2.6)
 
 EOF
 }
@@ -662,7 +668,7 @@ EOF
 
 show_help() {
     cat <<EOF
-deepantigravity — Use \`agy\` (Antigravity CLI) with Kimi or Nvidia NIM
+deepantigravity — Use \`agy\` (Antigravity CLI) with cheap LLM backends
 
 USAGE
   deepantigravity --setup                    one-time, requires sudo password
@@ -671,8 +677,9 @@ USAGE
   deepantigravity --status                   diagnostic
 
 BACKENDS (all routed through our local proxy)
-  -b kimi                 Kimi Code             (Anthropic-native upstream)
-  -b nv | nvidia          Nvidia NIM            (OpenAI-compat upstream)
+  -b kimi                    Kimi Code                (Anthropic-native upstream)
+  -b ds | deepseek          DeepSeek Web OAuth       (Anthropic-native upstream)
+  -b nv | nvidia            Nvidia NIM               (OpenAI-compat upstream)
 
 To use real Google Gemini just run \`agy\` directly — deepantigravity adds
 the /etc/hosts redirect only WHILE running, and removes it on exit.
@@ -684,7 +691,7 @@ PREREQUISITES
 
 CONFIG
   Edit proxy/.env. Set API_PROVIDER and at least one of KIMI_API_KEY,
-  NVIDIA_API_KEY.
+  DEEPSEEK_OAUTH_WEB_TOKEN, or NVIDIA_API_KEY.
 
 DEBUG
   DEEPANTIGRAVITY_DEBUG=1 deepantigravity -b kimi
@@ -702,8 +709,9 @@ resolve_backend() {
 
     case "$backend" in
         kimi)       if [[ -z "${KIMI_API_KEY:-}" || "$KIMI_API_KEY" =~ ^sk-your ]]; then echo "ERROR: KIMI_API_KEY not set in proxy/.env" >&2; exit 1; fi ;;
+        deepseekOauthWeb)   if [[ -z "${DEEPSEEK_OAUTH_WEB_TOKEN:-}" || "$DEEPSEEK_OAUTH_WEB_TOKEN" =~ ^your-deepseek-oauth-token ]]; then echo "ERROR: DEEPSEEK_OAUTH_WEB_TOKEN not set in proxy/.env" >&2; exit 1; fi ;;
         nvidia)     if [[ -z "${NVIDIA_API_KEY:-}" || "$NVIDIA_API_KEY" =~ ^nvapi-your ]]; then echo "ERROR: NVIDIA_API_KEY not set in proxy/.env" >&2; exit 1; fi ;;
-        *)          echo "ERROR: Unknown backend '$backend' (only kimi and nvidia are supported)" >&2; exit 1 ;;
+        *)          echo "ERROR: Unknown backend '$backend' (only kimi, deepseekOauthWeb, and nvidia are supported)" >&2; exit 1 ;;
     esac
 }
 

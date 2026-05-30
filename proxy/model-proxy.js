@@ -55,15 +55,19 @@ import {
     anthropicToOpenAI,
     OpenAIToAnthropicStream,
 } from './openai-translator.js';
+import { solvePowChallenge } from './deepseek-pow.js';
 
 const require = createRequire(import.meta.url);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+// Upstream request timeout. Default 5 min; override via env for slow
+// models (e.g. DEEPANTIGRAVITY_TIMEOUT_MS=600000 for 10 min).
+const REQUEST_TIMEOUT_MS = parseInt(process.env.DEEPANTIGRAVITY_TIMEOUT_MS || '', 10) || (5 * 60 * 1000);
 
 const ANTHROPIC_NATIVE = new Set(['kimi']);
 const OPENAI_COMPAT = new Set(['nvidia']);
+const DEEPSEEK_WEB = new Set(['deepseekOauthWeb']);
 
 const TARGET_HOSTS = new Set([
     'cloudcode-pa.googleapis.com',
@@ -91,17 +95,28 @@ const DEEPANTIGRAVITY_KEY_PREFIX = 'dag-';
 // tool loops and `--print`; the trailing 250B–675B models are capable
 // but slow and may time out on large agentic payloads.
 const DEFAULT_NVIDIA_MODELS = [
-    // ── fast & reliable for agentic/tool use (recommended) ──
+    // // ── fast & reliable for agentic/tool use (recommended) ──
+    // 'openai/gpt-oss-120b',
+    // 'stepfun-ai/step-3.7-flash',
+    // 'deepseek-ai/deepseek-v4-flash',
+    // 'meta/llama-3.3-70b-instruct',
+    // // ── strong but slower ──
+    // 'moonshotai/kimi-k2.6',
+    // 'deepseek-ai/deepseek-v4-pro',
+    // 'qwen/qwen3-coder-480b-a35b-instruct',
+    // // ── very large / slow (may time out on big tool payloads) ──
+    // 'qwen/qwen3.5-397b-a17b',
+    // 'nvidia/nemotron-3-super-120b-a12b',
+    // 'mistralai/mistral-large-3-675b-instruct-2512',
+
     'openai/gpt-oss-120b',
-    'openai/gpt-oss-20b',
-    'stepfun-ai/step-3.7-flash',
     'deepseek-ai/deepseek-v4-flash',
-    'meta/llama-3.3-70b-instruct',
-    // ── strong but slower ──
-    'moonshotai/kimi-k2.6',
-    'deepseek-ai/deepseek-v4-pro',
     'qwen/qwen3-coder-480b-a35b-instruct',
-    // ── very large / slow (may time out on big tool payloads) ──
+    'deepseek-ai/deepseek-v4-pro',
+    'moonshotai/kimi-k2.6',
+    'stepfun-ai/step-3.7-flash',
+    'z-ai/glm-5.1',
+    'minimaxai/minimax-m2.7',
     'qwen/qwen3.5-397b-a17b',
     'nvidia/nemotron-3-super-120b-a12b',
     'mistralai/mistral-large-3-675b-instruct-2512',
@@ -126,17 +141,38 @@ function keyToModel(key, modelList) {
     return null;
 }
 
-// The selectable model list for the active backend (nvidia only for now).
+// The selectable model list for the active backend.
 function selectableModels(opts) {
-    if (opts.backend !== 'nvidia') return [];
-    const fromEnv = (process.env.NVIDIA_MODELS || '').split(',')
-        .map(s => s.trim()).filter(Boolean);
-    const list = fromEnv.length > 0 ? fromEnv : DEFAULT_NVIDIA_MODELS;
-    // Always include the configured default target so it's pickable too.
-    if (opts.targetModel && !list.includes(opts.targetModel)) {
-        list.unshift(opts.targetModel);
+    if (opts.backend === 'nvidia') {
+        const fromEnv = (process.env.NVIDIA_MODELS || '').split(',')
+            .map(s => s.trim()).filter(Boolean);
+        const list = fromEnv.length > 0 ? fromEnv : DEFAULT_NVIDIA_MODELS;
+        // Always include the configured default target so it's pickable too.
+        if (opts.targetModel && !list.includes(opts.targetModel)) {
+            list.unshift(opts.targetModel);
+        }
+        return list;
     }
-    return list;
+    // Add support for deepseekOauthWeb model selection
+    if (opts.backend === 'deepseekOauthWeb') {
+        const fromEnv = (process.env.DEEPSEEK_OAUTH_WEB_MODELS || '').split(',')
+            .map(s => s.trim()).filter(Boolean);
+        // Default DeepSeek models for the web provider
+        const DEFAULT_DEEPSEEK_MODELS = [
+            'deepseek-v4-flash',
+            'deepseek-v4-pro',
+            'deepseek-chat',
+            'deepseek-coder',
+            'deepseek-reasoner',
+        ];
+        const list = fromEnv.length > 0 ? fromEnv : DEFAULT_DEEPSEEK_MODELS;
+        // Always include the configured default target so it's pickable too.
+        if (opts.targetModel && !list.includes(opts.targetModel)) {
+            list.unshift(opts.targetModel);
+        }
+        return list;
+    }
+    return []; // Other backends don't have model selection yet
 }
 
 // Cache real IPs of upstream hosts. Populated from env vars set by the
@@ -585,6 +621,8 @@ async function handleGenerate(req, res, bodyBuf, opts, onUsage) {
         await forwardAnthropic(res, anthBody, effectiveOpts, originalGeminiModel, onUsage);
     } else if (OPENAI_COMPAT.has(effectiveOpts.backend)) {
         await forwardOpenAI(res, anthBody, effectiveOpts, originalGeminiModel, onUsage);
+    } else if (DEEPSEEK_WEB.has(effectiveOpts.backend)) {
+        await forwardDeepSeekWeb(res, anthBody, effectiveOpts, originalGeminiModel, onUsage);
     } else {
         res.writeHead(500, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: { code: 500, message: `unsupported backend: ${effectiveOpts.backend}` }}));
@@ -689,6 +727,11 @@ async function forwardAnthropic(res, anthBody, opts, geminiModel, onUsage) {
         res.end(JSON.stringify({ error: { code: 502, message: e.message } }));
     });
 
+    upstream.on('timeout', () => {
+        console.error(`[deepantigravity]     upstream TIMED OUT after ${REQUEST_TIMEOUT_MS}ms (model produced no response)`);
+        upstream.destroy(new Error(`upstream timeout after ${REQUEST_TIMEOUT_MS}ms`));
+    });
+
     console.error(`[deepantigravity]     POST ${upstreamUrl.protocol}//${upstreamUrl.hostname}:${upstreamUrl.port || (isHttps ? 443 : 80)}${rebasePath(upstreamUrl.pathname, messagesPath)} (body=${body.length}b)`);
     upstream.write(body);
     upstream.end();
@@ -769,9 +812,189 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
         res.end(JSON.stringify({ error: { code: 502, message: e.message } }));
     });
 
+    // If the upstream stalls (model produces nothing for the whole
+    // timeout window), destroy the socket so the error handler fires
+    // instead of leaving agy hanging forever.
+    upstream.on('timeout', () => {
+        console.error(`[deepantigravity]     upstream TIMED OUT after ${REQUEST_TIMEOUT_MS}ms (model produced no response)`);
+        upstream.destroy(new Error(`upstream timeout after ${REQUEST_TIMEOUT_MS}ms`));
+    });
+
     console.error(`[deepantigravity]     POST ${upstreamUrl.protocol}//${upstreamUrl.hostname}:${upstreamUrl.port || (isHttps ? 443 : 80)}${rebasePath(upstreamUrl.pathname, '/chat/completions')} (body=${body.length}b)`);
     upstream.write(body);
     upstream.end();
+}
+
+
+// ════════════════════════════════════════════════════════════════
+// DeepSeek WEB chat (chat.deepseek.com) — text-only path
+// ════════════════════════════════════════════════════════════════
+// The web backend is NOT the Anthropic/OpenAI API. It needs a browser
+// session token + cookies + a sha3 proof-of-work per turn, speaks a
+// JSON-patch delta SSE protocol, and has NO tool-calling. We flatten the
+// conversation to a single prompt and stream text back. We reuse
+// AnthropicToGeminiStream by feeding it synthetic Anthropic SSE so the
+// (required) Gemini response wrapper is produced identically.
+const DS_WEB_HOST = 'chat.deepseek.com';
+const DS_WEB_BASE = '/api/v0';
+
+function dsWebHeaders(opts, extra = {}) {
+    return {
+        'accept': '*/*',
+        'authorization': `Bearer ${opts.upstreamKey}`,
+        'content-type': 'application/json',
+        'origin': 'https://chat.deepseek.com',
+        'referer': 'https://chat.deepseek.com/',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+        'x-app-version': '20241129.1',
+        'x-client-locale': 'en_US',
+        'x-client-platform': 'web',
+        'x-client-version': '1.0.0-always',
+        ...(opts.cookie ? { cookie: opts.cookie } : {}),
+        ...extra,
+    };
+}
+
+function dsWebPostJson(opts, path, payload) {
+    return new Promise((resolve, reject) => {
+        const body = JSON.stringify(payload);
+        const req = httpsRequest({
+            host: DS_WEB_HOST, port: 443, method: 'POST', path: DS_WEB_BASE + path,
+            headers: dsWebHeaders(opts, { 'content-length': Buffer.byteLength(body) }),
+            timeout: REQUEST_TIMEOUT_MS, family: 4,
+        }, (r) => {
+            let buf = '';
+            r.on('data', c => buf += c);
+            r.on('end', () => {
+                if (r.statusCode !== 200) return reject(new Error(`${path} → HTTP ${r.statusCode}: ${buf.slice(0, 300)}`));
+                try { resolve(JSON.parse(buf)); } catch { reject(new Error(`${path} → invalid JSON: ${buf.slice(0, 200)}`)); }
+            });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => req.destroy(new Error(`${path} timed out`)));
+        req.write(body); req.end();
+    });
+}
+
+// Collapse an Anthropic Messages body into one prompt string.
+function flattenAnthToPrompt(anthBody) {
+    const lines = [];
+    if (anthBody.system) lines.push(anthBody.system);
+    for (const m of (anthBody.messages || [])) {
+        const role = m.role === 'assistant' ? 'Assistant' : 'User';
+        let text;
+        if (typeof m.content === 'string') {
+            text = m.content;
+        } else {
+            text = (m.content || []).map(b => {
+                if (b.type === 'text') return b.text;
+                if (b.type === 'thinking') return b.thinking;
+                if (b.type === 'tool_use') return `[tool_call ${b.name}: ${JSON.stringify(b.input)}]`;
+                if (b.type === 'tool_result') return `[tool_result: ${typeof b.content === 'string' ? b.content : JSON.stringify(b.content)}]`;
+                return '';
+            }).filter(Boolean).join('\n');
+        }
+        if (text) lines.push(`${role}: ${text}`);
+    }
+    return lines.join('\n\n');
+}
+
+async function forwardDeepSeekWeb(res, anthBody, opts, geminiModel, onUsage) {
+    const prompt = flattenAnthToPrompt(anthBody);
+    const thinking = /reason|think/i.test(opts.targetModel || '');
+    try {
+        const sess = await dsWebPostJson(opts, '/chat_session/create', { character_id: null });
+        const sid = sess?.data?.biz_data?.id;
+        if (!sid) throw new Error('no session id in chat_session/create response');
+
+        const chResp = await dsWebPostJson(opts, '/chat/create_pow_challenge', { target_path: '/api/v0/chat/completion' });
+        const challenge = chResp?.data?.biz_data?.challenge;
+        if (!challenge) throw new Error('no challenge in create_pow_challenge response');
+        const pow = await solvePowChallenge(challenge);
+
+        const body = JSON.stringify({
+            chat_session_id: sid, parent_message_id: null, prompt,
+            ref_file_ids: [], thinking_enabled: thinking, search_enabled: false,
+        });
+        const headers = dsWebHeaders(opts, {
+            accept: 'text/event-stream', 'x-ds-pow-response': pow,
+            'content-length': Buffer.byteLength(body),
+        });
+
+        console.error(`[deepantigravity]     POST https://chat.deepseek.com/api/v0/chat/completion (session=${sid}, prompt=${prompt.length}b, thinking=${thinking})`);
+
+        const upstream = httpsRequest({
+            host: DS_WEB_HOST, port: 443, method: 'POST', path: DS_WEB_BASE + '/chat/completion',
+            headers, timeout: REQUEST_TIMEOUT_MS, family: 4,
+        }, (upRes) => {
+            console.error(`[deepantigravity]     deepseek web replied: ${upRes.statusCode} ${upRes.statusMessage}`);
+            if (upRes.statusCode !== 200) {
+                res.writeHead(upRes.statusCode, { 'content-type': 'application/json' });
+                let errBody = '';
+                upRes.on('data', c => errBody += c.toString());
+                upRes.on('end', () => {
+                    console.error(`[deepantigravity]     deepseek web error body: ${errBody.slice(0, 500)}`);
+                    res.end(errBody);
+                });
+                return;
+            }
+            res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+            if (opts._setLastModel) opts._setLastModel(opts.targetModel);
+
+            // Feed synthetic Anthropic SSE into the shared translator.
+            const tx = new AnthropicToGeminiStream({ originalGeminiModel: geminiModel });
+            tx.pipe(res);
+            tx.write(`data: ${JSON.stringify({ type: 'message_start', message: { model: opts.targetModel || 'deepseek-web', usage: { input_tokens: 0, output_tokens: 0 } } })}\n\n`);
+
+            // Web SSE is a JSON-patch delta stream with a sticky path cursor.
+            let buf = '', curPath = null, done = false;
+            const finish = () => {
+                if (done) return;
+                done = true;
+                tx.write(`data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' } })}\n\n`);
+                tx.write(`data: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+                tx.end();
+                onUsage(0, 0);
+            };
+            const onData = (s) => {
+                if (done) return;
+                let d; try { d = JSON.parse(s); } catch { return; }
+                if (typeof d.p === 'string') curPath = d.p;
+                const v = d.v;
+                if (curPath === 'response/content' && typeof v === 'string') {
+                    tx.write(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: v } })}\n\n`);
+                } else if (curPath === 'response/thinking_content' && typeof v === 'string') {
+                    tx.write(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: v } })}\n\n`);
+                } else if (curPath === 'response/status' && v === 'FINISHED') {
+                    finish();
+                }
+            };
+            upRes.on('data', (c) => {
+                buf += c.toString();
+                let idx;
+                while ((idx = buf.indexOf('\n\n')) !== -1) {
+                    const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
+                    for (const line of block.split('\n')) {
+                        if (line.startsWith('data:')) onData(line.slice(5).replace(/^ /, ''));
+                    }
+                }
+            });
+            upRes.on('end', finish);
+            upRes.on('error', (e) => console.error(`[deepantigravity]     deepseek web stream error: ${e.message}`));
+        });
+
+        upstream.on('error', (e) => {
+            console.error(`[deepantigravity]     deepseek web connection FAILED: ${e.code || ''} ${e.message}`);
+            if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: { code: 502, message: e.message } }));
+        });
+        upstream.on('timeout', () => upstream.destroy(new Error(`deepseek web timeout after ${REQUEST_TIMEOUT_MS}ms`)));
+        upstream.write(body); upstream.end();
+    } catch (e) {
+        console.error(`[deepantigravity]     deepseek web FAILED: ${e.stack || e.message}`);
+        if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { code: 502, message: String(e.message || e) } }));
+    }
 }
 
 

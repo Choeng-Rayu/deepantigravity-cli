@@ -122,7 +122,31 @@ export function anthropicToOpenAI(body, targetModel) {
         result.stream_options = { include_usage: true };
     }
 
+    // Per-model chat_template_kwargs. Several Nvidia NIM models produce
+    // NO output unless their thinking template flag is enabled, and the
+    // flag NAME differs per model family (verified against build.nvidia.com
+    // example snippets). Without this, those models hang and return empty.
+    const ctk = chatTemplateKwargsFor(result.model);
+    if (ctk) result.chat_template_kwargs = ctk;
+
     return result;
+}
+
+/**
+ * Map an upstream model id to the chat_template_kwargs it needs to emit
+ * output (mainly enabling its "thinking"/reasoning template). Keys differ
+ * by model family — values taken from Nvidia's own usage examples.
+ * Returns null for models that need nothing special.
+ */
+function chatTemplateKwargsFor(model) {
+    const m = String(model || '').toLowerCase();
+    if (m.includes('deepseek'))  return { thinking: true, reasoning_effort: 'high' };
+    if (m.includes('kimi'))      return { thinking: true };
+    if (m.includes('glm'))       return { enable_thinking: true, clear_thinking: false };
+    if (m.includes('nemotron'))  return { enable_thinking: true };
+    if (m.includes('qwen'))      return { enable_thinking: true };
+    if (m.includes('minimax'))   return { thinking: true };
+    return null;   // gpt-oss, step, llama, etc. work without it
 }
 
 /**

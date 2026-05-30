@@ -17,9 +17,9 @@
  * The launcher reads these and sets SSL_CERT_FILE=<bundle path> before
  * exec'ing `agy`.
  *
- * Supported backends: kimi (Anthropic-native upstream) and nvidia
- * (OpenAI-compat upstream — translation hops Gemini → Anthropic →
- * OpenAI on outbound and the reverse on inbound).
+ * Supported backends: kimi (Anthropic-native), deepseekOauthWeb
+ * (Anthropic-native), and nvidia (OpenAI-compat — translation hops
+ * Gemini → Anthropic → OpenAI on outbound and the reverse on inbound).
  */
 
 import { startProxy } from './model-proxy.js';
@@ -62,6 +62,12 @@ const BACKEND_DEFS = {
         modelEnv:     'KIMI_MODEL',
         modelDefault: 'kimi-for-coding',
     },
+    deepseekOauthWeb: {
+        urlDefault:   'https://chat.deepseek.com',
+        keyEnv:       'DEEPSEEK_OAUTH_WEB_TOKEN',
+        modelEnv:     'DEEPSEEK_OAUTH_WEB_MODEL',
+        modelDefault: 'deepseek-v4-flash',
+    },
     nvidia: {
         urlDefault:   'https://integrate.api.nvidia.com/v1',
         keyEnv:       'NVIDIA_API_KEY',
@@ -80,7 +86,7 @@ if (!backendArg) die('usage: node start-proxy.js <backend> [port] [bind-ip]');
 
 const backend = canonicalize(backendArg);
 const def = BACKEND_DEFS[backend];
-if (!def) die(`unsupported backend: ${backendArg} (only kimi and nvidia are supported)`);
+if (!def) die(`unsupported backend: ${backendArg} (supported: kimi, deepseekOauthWeb, nvidia)`);
 
 const upstreamKey = process.env[def.keyEnv] || '';
 const targetModel = process.env[def.modelEnv] || def.modelDefault;
@@ -101,6 +107,7 @@ try {
         upstreamUrl,
         upstreamKey,
         targetModel,
+        cookie: process.env.DEEPSEEK_OAUTH_WEB_COOKIE || '',
     });
     // Two stdout lines: launcher reads them. Use process.stdout.write
     // (NOT console.log) because Node's console.log adds ANSI color codes
@@ -118,6 +125,7 @@ try {
 function canonicalize(name) {
     switch (name) {
         case 'kimi':                  return 'kimi';
+        case 'ds': case 'deepseek':   return 'deepseekOauthWeb';  // Maps ds/deepseek to deepseekOauthWeb
         case 'nv': case 'nvidia':     return 'nvidia';
         default:                      return name;
     }

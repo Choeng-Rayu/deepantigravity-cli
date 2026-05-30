@@ -98,6 +98,9 @@ function Convert-Backend([string]$name) {
         'nv'         { 'nvidia' }
         'nvidia'     { 'nvidia' }
         'kimi'       { 'kimi' }
+        'ds'         { 'deepseekOauthWeb' }
+        'deepseek'   { 'deepseekOauthWeb' }
+        'deepseekOauthWeb' { 'deepseekOauthWeb' }
         default      { $name }
     }
 }
@@ -213,7 +216,7 @@ function Invoke-WithSessionLock {
 
 function Show-Help {
 @"
-deepantigravity — Use ``agy`` (Antigravity CLI) with Kimi or Nvidia NIM
+deepantigravity — Use ``agy`` (Antigravity CLI) with cheap LLM backends
 
 USAGE
   .\deepantigravity.ps1 -Setup                     one-time, requires admin
@@ -225,8 +228,9 @@ To use real Google Gemini just run ``agy`` directly — deepantigravity adds
 the hosts-file redirect only WHILE running, and removes it on exit.
 
 BACKENDS
-  -Backend kimi                   Kimi Code             (Anthropic-native upstream)
-  -Backend nv | nvidia            Nvidia NIM            (OpenAI-compat upstream)
+  -Backend kimi                     Kimi Code                (Anthropic-native upstream)
+  -Backend ds | deepseek            DeepSeek Web OAuth       (Anthropic-native upstream)
+  -Backend nv | nvidia              Nvidia NIM               (OpenAI-compat upstream)
 
 CONCURRENT SESSIONS
   * Multiple terminals using the SAME backend share one proxy (refcounted).
@@ -241,7 +245,7 @@ PREREQUISITES
 
 CONFIG
   Edit proxy\.env. Set API_PROVIDER and at least one of KIMI_API_KEY,
-  NVIDIA_API_KEY.
+  DEEPSEEK_OAUTH_WEB_TOKEN, or NVIDIA_API_KEY.
 "@
 }
 
@@ -275,8 +279,9 @@ function Show-Status {
     }
     Write-Host ''
     Write-Host '  Keys:'
-    Write-Host "    KIMI_API_KEY:      $(Hide-Key $env:KIMI_API_KEY)"
-    Write-Host "    NVIDIA_API_KEY:    $(Hide-Key $env:NVIDIA_API_KEY)"
+    Write-Host "    KIMI_API_KEY:             $(Hide-Key $env:KIMI_API_KEY)"
+    Write-Host "    DEEPSEEK_OAUTH_WEB_TOKEN: $(Hide-Key $env:DEEPSEEK_OAUTH_WEB_TOKEN)"
+    Write-Host "    NVIDIA_API_KEY:           $(Hide-Key $env:NVIDIA_API_KEY)"
     Write-Host ''
     Write-Host "  Default backend:    $DefaultBackend"
     Write-Host "  Proxy port:         $DeepantigravityPort"
@@ -289,10 +294,11 @@ function Show-Cost {
   deepantigravity Provider Pricing
   =================================
 
-  Provider        Input/M    Output/M   Notes
-  ----------      --------   --------   -----------
-  Kimi Code       subscription          Anthropic-native, kimi-for-coding
-  Nvidia NIM      `$0.44      `$0.87      OpenAI-compat (default kimi-k2.6)
+  Provider           Input/M    Output/M   Notes
+  ----------         --------   --------   -----------
+  Kimi Code          subscription          Anthropic-native, kimi-for-coding
+  DeepSeek Web OAuth free                 Anthropic-native, deepseek-v4-flash / deepseek-v4-pro
+  Nvidia NIM         `$0.44      `$0.87      OpenAI-compat (default kimi-k2.6)
 
 "@
 }
@@ -333,8 +339,9 @@ function Resolve-Backend {
     $b = Convert-Backend $Backend
     switch ($b) {
         'kimi'       { if (-not $env:KIMI_API_KEY -or $env:KIMI_API_KEY.StartsWith('sk-your'))      { throw 'KIMI_API_KEY not set in proxy/.env' } }
+        'deepseekOauthWeb' { if (-not $env:DEEPSEEK_OAUTH_WEB_TOKEN -or $env:DEEPSEEK_OAUTH_WEB_TOKEN.StartsWith('your-deepseek-oauth-token')) { throw 'DEEPSEEK_OAUTH_WEB_TOKEN not set in proxy/.env' } }
         'nvidia'     { if (-not $env:NVIDIA_API_KEY -or $env:NVIDIA_API_KEY.StartsWith('nvapi-your')){ throw 'NVIDIA_API_KEY not set in proxy/.env' } }
-        default      { throw "Unknown backend: $b (only kimi and nvidia are supported)" }
+        default      { throw "Unknown backend: $b (only kimi, deepseekOauthWeb, and nvidia are supported)" }
     }
     return $b
 }
