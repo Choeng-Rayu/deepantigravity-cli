@@ -11,6 +11,7 @@ Step-by-step practical guide. For architecture details, see `README.md`.
 ```bash
 ./deepantigravity.sh -b kimi      # use Kimi Code
 ./deepantigravity.sh -b nv        # use Nvidia NIM
+./deepantigravity.sh -b deepseek  # use DeepSeek web session (emulated tools)
 ./deepantigravity.sh --help       # show all options
 agy                                # use real Gemini (unchanged)
 ```
@@ -84,6 +85,7 @@ All items should show ✓. After this, **no more sudo needed**.
 ./deepantigravity.sh              # uses default backend from .env
 ./deepantigravity.sh -b kimi      # force Kimi Code
 ./deepantigravity.sh -b nv        # force Nvidia NIM
+./deepantigravity.sh -b deepseek  # force DeepSeek web session (emulated tools)
 ./deepantigravity.sh --status     # check setup and running state
 ```
 
@@ -114,6 +116,55 @@ Three ways:
 | Per-launch flag | `./deepantigravity.sh -b kimi` or `-b nv` |
 | Change default | Edit `API_PROVIDER=nvidia` in `proxy/.env` |
 | Change model | Edit `NVIDIA_MODEL=` or `KIMI_MODEL=` in `proxy/.env` |
+
+---
+
+## Optional: DeepSeek web session backend (`-b deepseek`)
+
+This backend drives the **`chat.deepseek.com` web chat** instead of the
+paid API, so it works with a normal DeepSeek website login (no API key).
+
+> **Tools are emulated.** The web endpoint has no *native* tool-calling, so
+> the proxy describes the tools in the prompt and parses `<tool_call>`
+> markers back into real actions. Agentic features (file edits, terminal,
+> etc.) **do work**, but less reliably than on a native API backend — a
+> model may occasionally describe an action instead of emitting the marker.
+> For the most reliable agentic use, prefer an API-key backend (Kimi,
+> Nvidia, or a DeepSeek `sk-` API key).
+
+### Get the two secrets from your browser
+
+Open `chat.deepseek.com`, log in, then press **F12**:
+
+1. **Token** — Application → Local Storage → `https://chat.deepseek.com`
+   → key `userToken` → copy its `value`.
+2. **Cookie** — Network → click any `api/v0/...` request → Request Headers
+   → copy the **entire** `cookie:` value (it must contain `ds_session_id`
+   and `aws-waf-token`).
+
+### Put them in `proxy/.env`
+
+```ini
+DEEPSEEK_OAUTH_WEB_TOKEN=<the userToken value>
+DEEPSEEK_OAUTH_WEB_MODEL=deepseek-v4-pro
+DEEPSEEK_OAUTH_WEB_COOKIE=aws-waf-token=...; ds_session_id=...
+```
+
+> Defaults to the expert model **`deepseek-v4-pro`** with reasoning
+> ("thinking") **on** and DeepSeek V4's full **1M-token context**. Disable
+> thinking with `DEEPSEEK_OAUTH_WEB_THINKING=0`.
+
+### Run it
+
+```bash
+./deepantigravity.sh -b deepseek -- --print "what is 6*7?"
+#   → 6 × 7 = 42
+```
+
+> **Credentials expire.** When answers start failing with 401 / "WAF" /
+> "please wait" errors, the token or cookie has lapsed — re-grab both from
+> the browser. Treat them like passwords; anyone with them can use your
+> DeepSeek account.
 
 ---
 

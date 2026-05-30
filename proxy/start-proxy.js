@@ -66,7 +66,7 @@ const BACKEND_DEFS = {
         urlDefault:   'https://chat.deepseek.com',
         keyEnv:       'DEEPSEEK_OAUTH_WEB_TOKEN',
         modelEnv:     'DEEPSEEK_OAUTH_WEB_MODEL',
-        modelDefault: 'deepseek-v4-flash',
+        modelDefault: 'deepseek-v4-pro',
     },
     nvidia: {
         urlDefault:   'https://integrate.api.nvidia.com/v1',

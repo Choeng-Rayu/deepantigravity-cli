@@ -159,8 +159,8 @@ function selectableModels(opts) {
             .map(s => s.trim()).filter(Boolean);
         // Default DeepSeek models for the web provider
         const DEFAULT_DEEPSEEK_MODELS = [
-            'deepseek-v4-flash',
             'deepseek-v4-pro',
+            'deepseek-v4-flash',
             'deepseek-chat',
             'deepseek-coder',
             'deepseek-reasoner',
@@ -526,6 +526,13 @@ async function forwardAndRewriteModels(req, res, body, upstreamHost, opts) {
                             entry.recommended = false;
                             delete entry.tagTitle;
                             delete entry.tagDescription;
+                            // DeepSeek V4 has a 1M-token context and supports
+                            // a reasoning ("thinking") mode — advertise both
+                            // so agy sizes context correctly and shows it.
+                            if (opts.backend === 'deepseekOauthWeb') {
+                                entry.maxTokens = 1048576;
+                                entry.supportsThinking = true;
+                            }
                             models[key] = entry;
                             injectedKeys.push(key);
                         }
@@ -827,16 +834,37 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
 
 
 // ════════════════════════════════════════════════════════════════
-// DeepSeek WEB chat (chat.deepseek.com) — text-only path
+// DeepSeek WEB chat (chat.deepseek.com)
 // ════════════════════════════════════════════════════════════════
 // The web backend is NOT the Anthropic/OpenAI API. It needs a browser
 // session token + cookies + a sha3 proof-of-work per turn, speaks a
-// JSON-patch delta SSE protocol, and has NO tool-calling. We flatten the
-// conversation to a single prompt and stream text back. We reuse
+// JSON-patch delta SSE protocol, and has NO NATIVE tool-calling. We
+// flatten the conversation to a single prompt and reuse
 // AnthropicToGeminiStream by feeding it synthetic Anthropic SSE so the
 // (required) Gemini response wrapper is produced identically.
+//
+// TOOLS: emulated. When agy sends tool definitions, we describe them in
+// the prompt and ask the model to emit <tool_call>{...}</tool_call>
+// markers; we parse those out of the reply and re-emit them as real
+// functionCalls (Anthropic tool_use → Gemini), so agy actually executes
+// them. Less reliable than native tools, but it makes file edits /
+// terminal / etc. work.
 const DS_WEB_HOST = 'chat.deepseek.com';
 const DS_WEB_BASE = '/api/v0';
+
+// Persistent tool-emulation audit log. The per-session proxy.log is
+// deleted when agy exits (refcount → 0), which loses the [tools] traces.
+// When DEEPANTIGRAVITY_DEBUG=1 we also append them here so per-tool
+// debugging survives across runs. Disable with DEEPSEEK_TOOL_LOG=0.
+function dsToolLog(line) {
+    if (process.env.DEEPANTIGRAVITY_DEBUG !== '1' || process.env.DEEPSEEK_TOOL_LOG === '0') return;
+    console.error(line);
+    try {
+        require('fs').appendFileSync(
+            require('path').join(__dirname, '.cache', 'deepseek-tools.log'),
+            `${new Date().toISOString()} ${line}\n`);
+    } catch { /* best-effort */ }
+}
 
 function dsWebHeaders(opts, extra = {}) {
     return {
@@ -889,8 +917,8 @@ function flattenAnthToPrompt(anthBody) {
             text = (m.content || []).map(b => {
                 if (b.type === 'text') return b.text;
                 if (b.type === 'thinking') return b.thinking;
-                if (b.type === 'tool_use') return `[tool_call ${b.name}: ${JSON.stringify(b.input)}]`;
-                if (b.type === 'tool_result') return `[tool_result: ${typeof b.content === 'string' ? b.content : JSON.stringify(b.content)}]`;
+                if (b.type === 'tool_use') return `<tool_call>${JSON.stringify({ name: b.name, arguments: b.input || {} })}</tool_call>`;
+                if (b.type === 'tool_result') return `<tool_result>${typeof b.content === 'string' ? b.content : JSON.stringify(b.content)}</tool_result>`;
                 return '';
             }).filter(Boolean).join('\n');
         }
@@ -899,9 +927,100 @@ function flattenAnthToPrompt(anthBody) {
     return lines.join('\n\n');
 }
 
+// Emulated tool-calling: the web endpoint has no native tools, so we
+// describe them in the prompt and ask the model to emit a marker we can
+// parse back into a real functionCall.
+function buildToolInstructions(tools) {
+    const defs = tools.map(t =>
+        `- ${t.name}: ${(t.description || '').split('\n')[0]}\n  arguments JSON schema: ${JSON.stringify(t.input_schema || {})}`
+    ).join('\n');
+    return `# Tool use\nYou can perform actions by calling tools. Available tools:\n${defs}\n\n` +
+        `To call a tool, output ONLY a tool-call marker and nothing else, exactly:\n` +
+        `<tool_call>{"name": "<tool_name>", "arguments": { ... }}</tool_call>\n` +
+        `Rules:\n- Emit the marker verbatim (no code fences, no extra prose around it).\n` +
+        `- You may emit several <tool_call> markers to run multiple tools.\n` +
+        `- Use a tool whenever the task requires reading, writing, editing files, running commands, or any action — do NOT just describe what you would do.\n` +
+        `- After tool results come back (as <tool_result>…</tool_result>), continue. When the task is done, reply normally with no marker.`;
+}
+
+const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+
+// Strip an optional ```json … ``` (or ``` … ```) fence around a payload.
+function stripCodeFence(s) {
+    const m = s.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    return m ? m[1] : s;
+}
+
+// Extract tool calls from model output, tolerant of the common LLM
+// deviations the logs revealed:
+//   1. <tool_call>{...}</tool_call>            (canonical)
+//   2. <tool_call>```json {...} ```</tool_call> (fenced inside marker)
+//   3. bare ```json {...} ``` with a "name" key  (no marker)
+//   4. a bare {"name":...,"arguments":...} object (no marker, no fence)
+// Returns { calls:[{name,arguments}], cleanedText } where cleanedText has
+// every consumed span removed.
+function extractToolCalls(content) {
+    const calls = [];
+    let cleaned = content;
+    const tryPush = (raw) => {
+        try {
+            const obj = JSON.parse(stripCodeFence(raw.trim()));
+            if (obj && typeof obj.name === 'string') { calls.push(obj); return true; }
+        } catch { /* not a tool call */ }
+        return false;
+    };
+
+    // 1+2: explicit <tool_call> markers (fence stripped inside tryPush).
+    let m;
+    TOOL_CALL_RE.lastIndex = 0;
+    while ((m = TOOL_CALL_RE.exec(content)) !== null) {
+        if (tryPush(m[1])) cleaned = cleaned.replace(m[0], '');
+    }
+    if (calls.length > 0) return { calls, cleanedText: cleaned.trim() };
+
+    // 3+4: no markers — scan for balanced {...} objects that contain a
+    // "name" key and parse as a tool call. Handles fenced or bare JSON.
+    for (const span of findBalancedObjects(content)) {
+        if (/"name"\s*:/.test(span) && tryPush(span)) {
+            cleaned = cleaned.replace(span, '');
+        }
+    }
+    // Drop now-empty code fences left behind by removing fenced JSON.
+    if (calls.length > 0) cleaned = cleaned.replace(/```(?:json)?\s*```/gi, '');
+    return { calls, cleanedText: cleaned.trim() };
+}
+
+// Yield every top-level balanced {...} substring (string-aware, so braces
+// inside JSON strings don't miscount).
+function findBalancedObjects(s) {
+    const out = [];
+    let depth = 0, start = -1, inStr = false, esc = false;
+    for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (ch === '\\') esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === '{') { if (depth === 0) start = i; depth++; }
+        else if (ch === '}') { depth--; if (depth === 0 && start !== -1) { out.push(s.slice(start, i + 1)); start = -1; } }
+    }
+    return out;
+}
+
 async function forwardDeepSeekWeb(res, anthBody, opts, geminiModel, onUsage) {
-    const prompt = flattenAnthToPrompt(anthBody);
-    const thinking = /reason|think/i.test(opts.targetModel || '');
+    const hasTools = Array.isArray(anthBody.tools) && anthBody.tools.length > 0;
+    let prompt = flattenAnthToPrompt(anthBody);
+    if (hasTools) prompt = buildToolInstructions(anthBody.tools) + '\n\n' + prompt;
+    // Thinking ON by default (DeepSeek's reasoning mode). Disable with
+    // DEEPSEEK_OAUTH_WEB_THINKING=0.
+    const thinking = process.env.DEEPSEEK_OAUTH_WEB_THINKING !== '0';
+    const dbg = process.env.DEEPANTIGRAVITY_DEBUG === '1';
+    if (dbg && hasTools) {
+        dsToolLog(`[deepantigravity]     [tools] offered ${anthBody.tools.length}: ${anthBody.tools.map(t => t.name).join(', ')}`);
+    }
     try {
         const sess = await dsWebPostJson(opts, '/chat_session/create', { character_id: null });
         const sid = sess?.data?.biz_data?.id;
@@ -933,7 +1052,7 @@ async function forwardDeepSeekWeb(res, anthBody, opts, geminiModel, onUsage) {
                 let errBody = '';
                 upRes.on('data', c => errBody += c.toString());
                 upRes.on('end', () => {
-                    console.error(`[deepantigravity]     deepseek web error body: ${errBody.slice(0, 500)}`);
+                    dsToolLog(`[deepantigravity]     deepseek web error body: ${errBody.slice(0, 500)}`);
                     res.end(errBody);
                 });
                 return;
@@ -948,10 +1067,45 @@ async function forwardDeepSeekWeb(res, anthBody, opts, geminiModel, onUsage) {
 
             // Web SSE is a JSON-patch delta stream with a sticky path cursor.
             let buf = '', curPath = null, done = false;
+            // When tools are offered we buffer the assistant text instead of
+            // streaming it, so we can extract <tool_call> markers at the end
+            // and re-emit them as real functionCalls (emulated tool use).
+            let contentBuf = '';
+            const emitText = (t) => tx.write(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: t } })}\n\n`);
             const finish = () => {
                 if (done) return;
                 done = true;
-                tx.write(`data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' } })}\n\n`);
+                let stopReason = 'end_turn';
+                if (hasTools) {
+                    if (dbg) {
+                        const preview = contentBuf.length > 1200
+                            ? contentBuf.slice(0, 600) + `\n…[${contentBuf.length}b total]…\n` + contentBuf.slice(-600)
+                            : contentBuf;
+                        dsToolLog(`[deepantigravity]     [tools] raw model content (${contentBuf.length}b):\n${preview}`);
+                    }
+                    const { calls, cleanedText } = extractToolCalls(contentBuf);
+                    if (dbg) {
+                        for (let i = 0; i < calls.length; i++) {
+                            dsToolLog(`[deepantigravity]     [tools] parsed call #${i + 1}: name=${calls[i].name} args=${JSON.stringify(calls[i].arguments || {}).slice(0, 200)}`);
+                        }
+                        if (calls.length === 0 && /<tool|tool_call|"name"\s*:/i.test(contentBuf)) {
+                            dsToolLog(`[deepantigravity]     [tools] content looks tool-ish but NO calls extracted — unhandled format`);
+                        }
+                        dsToolLog(`[deepantigravity]     [tools] valid calls=${calls.length}`);
+                    }
+                    if (cleanedText) emitText(cleanedText);
+                    if (calls.length > 0) {
+                        for (const c of calls) {
+                            const id = `toolu_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+                            tx.write(`data: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id, name: c.name, input: {} } })}\n\n`);
+                            tx.write(`data: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(c.arguments || {}) } })}\n\n`);
+                            tx.write(`data: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+                        }
+                        stopReason = 'tool_use';
+                        dsToolLog(`[deepantigravity]     emulated tool_use: ${calls.map(c => c.name).join(', ')}`);
+                    }
+                }
+                tx.write(`data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: stopReason } })}\n\n`);
                 tx.write(`data: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
                 tx.end();
                 onUsage(0, 0);
@@ -962,7 +1116,8 @@ async function forwardDeepSeekWeb(res, anthBody, opts, geminiModel, onUsage) {
                 if (typeof d.p === 'string') curPath = d.p;
                 const v = d.v;
                 if (curPath === 'response/content' && typeof v === 'string') {
-                    tx.write(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: v } })}\n\n`);
+                    if (hasTools) contentBuf += v;          // buffer for marker parsing
+                    else emitText(v);                        // stream directly
                 } else if (curPath === 'response/thinking_content' && typeof v === 'string') {
                     tx.write(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: v } })}\n\n`);
                 } else if (curPath === 'response/status' && v === 'FINISHED') {
