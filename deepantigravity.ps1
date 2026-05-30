@@ -31,11 +31,18 @@ param(
     [switch]$CaPath,
     [switch]$InstallCa,
     [Alias('h')][switch]$Help,
+    [switch]$DebugProxy,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$AgyArgs
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Carry DEEPANTIGRAVITY_DEBUG across UAC elevation. The elevated instance
+# starts with a fresh environment (the runtime $env: var is lost), so the
+# leader forwards -DebugProxy and we re-set it here. The spawned proxy then
+# inherits it (parity with deepantigravity.sh, which forwards DEBUG too).
+if ($DebugProxy) { $env:DEEPANTIGRAVITY_DEBUG = '1' }
 
 # ── Resolve symlinks so $ScriptDir always points at the real repo ──
 $_scriptPath = $MyInvocation.MyCommand.Path
@@ -229,7 +236,7 @@ the hosts-file redirect only WHILE running, and removes it on exit.
 
 BACKENDS
   -Backend kimi                     Kimi Code                (Anthropic-native upstream)
-  -Backend ds | deepseek            DeepSeek Web OAuth       (Anthropic-native upstream)
+  -Backend ds | deepseek            DeepSeek Web OAuth       (chat.deepseek.com web — emulated tools)
   -Backend nv | nvidia              Nvidia NIM               (OpenAI-compat upstream)
 
 CONCURRENT SESSIONS
@@ -246,6 +253,9 @@ PREREQUISITES
 CONFIG
   Edit proxy\.env. Set API_PROVIDER and at least one of KIMI_API_KEY,
   DEEPSEEK_OAUTH_WEB_TOKEN, or NVIDIA_API_KEY.
+  DeepSeek web also needs DEEPSEEK_OAUTH_WEB_COOKIE (browser cookie with
+  ds_session_id + aws-waf-token). Thinking is on by default
+  (DEEPSEEK_OAUTH_WEB_THINKING=0 to disable).
 "@
 }
 
@@ -297,7 +307,7 @@ function Show-Cost {
   Provider           Input/M    Output/M   Notes
   ----------         --------   --------   -----------
   Kimi Code          subscription          Anthropic-native, kimi-for-coding
-  DeepSeek Web OAuth free                 Anthropic-native, deepseek-v4-flash / deepseek-v4-pro
+  DeepSeek Web OAuth free                 chat.deepseek.com web session, emulated tools, deepseek-v4-pro (1M ctx, thinking)
   Nvidia NIM         `$0.44      `$0.87      OpenAI-compat (default kimi-k2.6)
 
 "@
@@ -339,7 +349,7 @@ function Resolve-Backend {
     $b = Convert-Backend $Backend
     switch ($b) {
         'kimi'       { if (-not $env:KIMI_API_KEY -or $env:KIMI_API_KEY.StartsWith('sk-your'))      { throw 'KIMI_API_KEY not set in proxy/.env' } }
-        'deepseekOauthWeb' { if (-not $env:DEEPSEEK_OAUTH_WEB_TOKEN -or $env:DEEPSEEK_OAUTH_WEB_TOKEN.StartsWith('your-deepseek-oauth-token')) { throw 'DEEPSEEK_OAUTH_WEB_TOKEN not set in proxy/.env' } }
+        'deepseekOauthWeb' { if (-not $env:DEEPSEEK_OAUTH_WEB_TOKEN -or $env:DEEPSEEK_OAUTH_WEB_TOKEN.StartsWith('your-deepseek')) { throw 'DEEPSEEK_OAUTH_WEB_TOKEN not set in proxy/.env' } }
         'nvidia'     { if (-not $env:NVIDIA_API_KEY -or $env:NVIDIA_API_KEY.StartsWith('nvapi-your')){ throw 'NVIDIA_API_KEY not set in proxy/.env' } }
         default      { throw "Unknown backend: $b (only kimi, deepseekOauthWeb, and nvidia are supported)" }
     }
@@ -488,6 +498,16 @@ function Invoke-CleanupOnExit {
                 Write-Warning 'Last-out cleanup: cannot remove hosts entries without admin. Run -Teardown.'
             }
             if (Test-Path $SessionDir) {
+                # Under DEBUG, keep the proxy log for post-mortem inspection
+                # (parity with deepantigravity.sh's last-proxy-<backend>.log).
+                if ($env:DEEPANTIGRAVITY_DEBUG -eq '1') {
+                    $be = (Get-Content $SessionBackendFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+                    if (-not $be) { $be = 'unknown' }
+                    $dest = Join-Path $ScriptDir "proxy\.cache\last-proxy-$be.log"
+                    foreach ($src in @($SessionLogFile, "$SessionLogFile.err")) {
+                        if (Test-Path $src) { Get-Content $src -ErrorAction SilentlyContinue | Add-Content -Path $dest -ErrorAction SilentlyContinue }
+                    }
+                }
                 Remove-Item $SessionDir -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
@@ -505,6 +525,7 @@ function Invoke-CleanupOnExit {
 function Invoke-AsAdmin {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
     if ($Backend)       { $argList += @('-Backend', $Backend) }
+    if ($env:DEEPANTIGRAVITY_DEBUG -eq '1') { $argList += '-DebugProxy' }
     if ($AgyArgs)       { $argList += '--'; $argList += $AgyArgs }
     Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -Wait
 }

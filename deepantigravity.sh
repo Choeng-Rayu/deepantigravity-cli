@@ -625,7 +625,7 @@ show_cost() {
   Provider           Input/M    Output/M   Notes
   ----------         --------   --------   -----------
   Kimi Code          subscription          Anthropic-native, kimi-for-coding
-  DeepSeek Web OAuth free                 Anthropic-native, deepseek-v4-flash / deepseek-v4-pro
+  DeepSeek Web OAuth free                 chat.deepseek.com web session, emulated tools, deepseek-v4-pro (1M ctx, thinking)
   Nvidia NIM         \$0.44      \$0.87      OpenAI-compat (default kimi-k2.6)
 
 EOF
@@ -678,7 +678,7 @@ USAGE
 
 BACKENDS (all routed through our local proxy)
   -b kimi                    Kimi Code                (Anthropic-native upstream)
-  -b ds | deepseek          DeepSeek Web OAuth       (Anthropic-native upstream)
+  -b ds | deepseek          DeepSeek Web OAuth       (chat.deepseek.com web — emulated tools)
   -b nv | nvidia            Nvidia NIM               (OpenAI-compat upstream)
 
 To use real Google Gemini just run \`agy\` directly — deepantigravity adds
@@ -692,6 +692,9 @@ PREREQUISITES
 CONFIG
   Edit proxy/.env. Set API_PROVIDER and at least one of KIMI_API_KEY,
   DEEPSEEK_OAUTH_WEB_TOKEN, or NVIDIA_API_KEY.
+  DeepSeek web also needs DEEPSEEK_OAUTH_WEB_COOKIE (browser cookie with
+  ds_session_id + aws-waf-token). Thinking is on by default
+  (DEEPSEEK_OAUTH_WEB_THINKING=0 to disable).
 
 DEBUG
   DEEPANTIGRAVITY_DEBUG=1 deepantigravity -b kimi
@@ -709,7 +712,7 @@ resolve_backend() {
 
     case "$backend" in
         kimi)       if [[ -z "${KIMI_API_KEY:-}" || "$KIMI_API_KEY" =~ ^sk-your ]]; then echo "ERROR: KIMI_API_KEY not set in proxy/.env" >&2; exit 1; fi ;;
-        deepseekOauthWeb)   if [[ -z "${DEEPSEEK_OAUTH_WEB_TOKEN:-}" || "$DEEPSEEK_OAUTH_WEB_TOKEN" =~ ^your-deepseek-oauth-token ]]; then echo "ERROR: DEEPSEEK_OAUTH_WEB_TOKEN not set in proxy/.env" >&2; exit 1; fi ;;
+        deepseekOauthWeb)   if [[ -z "${DEEPSEEK_OAUTH_WEB_TOKEN:-}" || "$DEEPSEEK_OAUTH_WEB_TOKEN" =~ ^your-deepseek ]]; then echo "ERROR: DEEPSEEK_OAUTH_WEB_TOKEN not set in proxy/.env" >&2; exit 1; fi ;;
         nvidia)     if [[ -z "${NVIDIA_API_KEY:-}" || "$NVIDIA_API_KEY" =~ ^nvapi-your ]]; then echo "ERROR: NVIDIA_API_KEY not set in proxy/.env" >&2; exit 1; fi ;;
         *)          echo "ERROR: Unknown backend '$backend' (only kimi, deepseekOauthWeb, and nvidia are supported)" >&2; exit 1 ;;
     esac
