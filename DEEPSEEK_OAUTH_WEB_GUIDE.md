@@ -85,7 +85,8 @@ Open `https://chat.deepseek.com`, log in, press **F12**:
 ### File 1 — `proxy/.env` (and `.env.example`)
 
 ```ini
-# DeepSeek OAuth Web (chat.deepseek.com — TEXT ONLY)
+# DeepSeek OAuth Web (chat.deepseek.com web session)
+# Tools are EMULATED via prompt markers (see §4b) — agentic features work.
 # TOKEN:  chat.deepseek.com → F12 → Application → Local Storage → userToken → "value"
 # COOKIE: F12 → Network → any api/v0 request → Request Headers → full "cookie:" value
 DEEPSEEK_OAUTH_WEB_TOKEN=<your userToken value>
@@ -309,7 +310,9 @@ function dsWebPostJson(opts, path, payload) {
 }
 
 // The web endpoint takes ONE prompt — no roles array, no tools. Collapse
-// the whole Anthropic conversation (incl. tool blocks) into plain text.
+// the whole Anthropic conversation into plain text. Prior tool turns are
+// rendered back in the SAME emulation markers so multi-step loops stay
+// coherent (the model sees its own past calls + their results).
 function flattenAnthToPrompt(anthBody) {
     const lines = [];
     if (anthBody.system) lines.push(anthBody.system);
@@ -322,8 +325,8 @@ function flattenAnthToPrompt(anthBody) {
             text = (m.content || []).map(b => {
                 if (b.type === 'text') return b.text;
                 if (b.type === 'thinking') return b.thinking;
-                if (b.type === 'tool_use') return `[tool_call ${b.name}: ${JSON.stringify(b.input)}]`;
-                if (b.type === 'tool_result') return `[tool_result: ${typeof b.content === 'string' ? b.content : JSON.stringify(b.content)}]`;
+                if (b.type === 'tool_use') return `<tool_call>${JSON.stringify({ name: b.name, arguments: b.input || {} })}</tool_call>`;
+                if (b.type === 'tool_result') return `<tool_result>${typeof b.content === 'string' ? b.content : JSON.stringify(b.content)}</tool_result>`;
                 return '';
             }).filter(Boolean).join('\n');
         }
@@ -332,10 +335,28 @@ function flattenAnthToPrompt(anthBody) {
     return lines.join('\n\n');
 }
 
+// Build the tool-use instruction block prepended to the prompt when agy
+// offers tools. This is what teaches the web model to emit markers.
+function buildToolInstructions(tools) {
+    const defs = tools.map(t =>
+        `- ${t.name}: ${(t.description || '').split('\n')[0]}\n  arguments JSON schema: ${JSON.stringify(t.input_schema || {})}`
+    ).join('\n');
+    return `# Tool use\nYou can perform actions by calling tools. Available tools:\n${defs}\n\n` +
+        `To call a tool, output ONLY a tool-call marker and nothing else, exactly:\n` +
+        `<tool_call>{"name": "<tool_name>", "arguments": { ... }}</tool_call>\n` +
+        `Rules:\n- Emit the marker verbatim (no code fences, no extra prose around it).\n` +
+        `- You may emit several <tool_call> markers to run multiple tools.\n` +
+        `- Use a tool whenever the task requires reading, writing, editing files, running commands, or any action — do NOT just describe what you would do.\n` +
+        `- After tool results come back (as <tool_result>…</tool_result>), continue. When the task is done, reply normally with no marker.`;
+}
+
 async function forwardDeepSeekWeb(res, anthBody, opts, geminiModel, onUsage) {
-    const prompt = flattenAnthToPrompt(anthBody);
+    const hasTools = Array.isArray(anthBody.tools) && anthBody.tools.length > 0;
+    let prompt = flattenAnthToPrompt(anthBody);
+    if (hasTools) prompt = buildToolInstructions(anthBody.tools) + '\n\n' + prompt;
     // Thinking ON by default; disable with DEEPSEEK_OAUTH_WEB_THINKING=0.
     const thinking = process.env.DEEPSEEK_OAUTH_WEB_THINKING !== '0';
+    const dbg = process.env.DEEPANTIGRAVITY_DEBUG === '1';
     try {
         // 1. session
         const sess = await dsWebPostJson(opts, '/chat_session/create', { character_id: null });
@@ -377,11 +398,37 @@ async function forwardDeepSeekWeb(res, anthBody, opts, geminiModel, onUsage) {
             tx.pipe(res);
             tx.write(`data: ${JSON.stringify({ type: 'message_start', message: { model: opts.targetModel || 'deepseek-web', usage: { input_tokens: 0, output_tokens: 0 } } })}\n\n`);
 
+            // With tools we BUFFER content (instead of streaming) so we can
+            // scan the full reply for <tool_call> markers at the end. We
+            // also track thinking text as a fallback for empty replies.
             let buf = '', curPath = null, done = false;
+            let contentBuf = '', thinkingBuf = '';
+            const emitText = (t) => tx.write(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: t } })}\n\n`);
+
             const finish = () => {
                 if (done) return;
                 done = true;
-                tx.write(`data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' } })}\n\n`);
+                let stopReason = 'end_turn';
+                if (hasTools) {
+                    const { calls, cleanedText } = extractToolCalls(contentBuf);
+                    if (cleanedText) emitText(cleanedText);
+                    if (calls.length > 0) {
+                        // Re-emit each marker as a real Anthropic tool_use block;
+                        // AnthropicToGeminiStream turns it into a Gemini functionCall.
+                        for (const c of calls) {
+                            const id = `toolu_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+                            tx.write(`data: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id, name: c.name, input: {} } })}\n\n`);
+                            tx.write(`data: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(c.arguments || {}) } })}\n\n`);
+                            tx.write(`data: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+                        }
+                        stopReason = 'tool_use';
+                    } else if (!cleanedText && thinkingBuf.trim()) {
+                        // Whole reply went to the thinking channel → surface it
+                        // so agy isn't handed a blank turn. (See §"The empty-turn bug".)
+                        emitText(thinkingBuf.trim());
+                    }
+                }
+                tx.write(`data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: stopReason } })}\n\n`);
                 tx.write(`data: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
                 tx.end();
                 onUsage(0, 0);
@@ -392,8 +439,10 @@ async function forwardDeepSeekWeb(res, anthBody, opts, geminiModel, onUsage) {
                 if (typeof d.p === 'string') curPath = d.p;   // sticky path cursor
                 const v = d.v;
                 if (curPath === 'response/content' && typeof v === 'string') {
-                    tx.write(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: v } })}\n\n`);
+                    if (hasTools) contentBuf += v;            // buffer for marker parsing
+                    else emitText(v);                          // no tools → stream directly
                 } else if (curPath === 'response/thinking_content' && typeof v === 'string') {
+                    if (hasTools) thinkingBuf += v;
                     tx.write(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: v } })}\n\n`);
                 } else if (curPath === 'response/status' && v === 'FINISHED') {
                     finish();
@@ -425,6 +474,105 @@ async function forwardDeepSeekWeb(res, anthBody, opts, geminiModel, onUsage) {
     }
 }
 ```
+
+> The `dbg`/`dsToolLog` diagnostic lines are omitted above for brevity —
+> see §5.4. The two helpers the forwarder depends on, `buildToolInstructions`
+> and `extractToolCalls`, are shown in the next two sub-sections because
+> they are where the tool-calling correctness lives.
+
+### (f) The tool-call extractor — and the bug it fixes
+
+The first version used a single regex, `` /<tool_call>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g ``,
+which only matched the **canonical** marker. Real `deepseek-v4-pro` output
+deviated in three ways that all silently failed to parse (turns stalled
+with `valid calls=0`):
+
+| Deviation | Example the model actually emitted |
+|---|---|
+| fenced JSON **inside** the marker | `<tool_call>\`\`\`json {…} \`\`\`</tool_call>` |
+| bare fenced JSON, **no marker** | `` ```json {"name":…} ``` `` |
+| a bare `{"name":…}` object, no marker/fence | `I'll call {"name":"view_file",…} now` |
+
+The fix is a tolerant extractor that tries the marker first, then falls
+back to scanning for balanced JSON objects (string-aware, so braces inside
+strings don't miscount). This is the current code:
+
+```js
+const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+
+function stripCodeFence(s) {            // strip ```json … ``` if present
+    const m = s.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    return m ? m[1] : s;
+}
+
+function extractToolCalls(content) {
+    const calls = [];
+    let cleaned = content;
+    const tryPush = (raw) => {
+        try {
+            const obj = JSON.parse(stripCodeFence(raw.trim()));
+            if (obj && typeof obj.name === 'string') { calls.push(obj); return true; }
+        } catch { /* not a tool call */ }
+        return false;
+    };
+
+    // 1+2: explicit <tool_call> markers (fence stripped inside tryPush).
+    let m;
+    TOOL_CALL_RE.lastIndex = 0;
+    while ((m = TOOL_CALL_RE.exec(content)) !== null) {
+        if (tryPush(m[1])) cleaned = cleaned.replace(m[0], '');
+    }
+    if (calls.length > 0) return { calls, cleanedText: cleaned.trim() };
+
+    // 3+4: no markers — scan for balanced {...} objects with a "name" key.
+    for (const span of findBalancedObjects(content)) {
+        if (/"name"\s*:/.test(span) && tryPush(span)) cleaned = cleaned.replace(span, '');
+    }
+    if (calls.length > 0) cleaned = cleaned.replace(/```(?:json)?\s*```/gi, '');
+    return { calls, cleanedText: cleaned.trim() };
+}
+
+// Yield every top-level balanced {...} substring. String-aware: braces
+// inside JSON string values are ignored, so nested objects parse whole.
+function findBalancedObjects(s) {
+    const out = [];
+    let depth = 0, start = -1, inStr = false, esc = false;
+    for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (ch === '\\') esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === '{') { if (depth === 0) start = i; depth++; }
+        else if (ch === '}') { depth--; if (depth === 0 && start !== -1) { out.push(s.slice(start, i + 1)); start = -1; } }
+    }
+    return out;
+}
+```
+
+> **Why a balanced-brace scanner, not a bigger regex?** The original
+> `\{[\s\S]*?\}` is non-greedy and stops at the *first* `}`, so any tool
+> whose `arguments` contain a nested object/array (e.g.
+> `multi_replace_file_content` with an `Edits:[{…}]` list) would be
+> truncated and fail `JSON.parse`. `findBalancedObjects` tracks brace depth
+> while skipping string contents, so nested arguments parse whole.
+
+### (g) The empty-turn bug (skills surfaced this)
+
+While testing a SKILL.md workflow, agy printed **nothing**. The log showed
+a final turn with `raw model content (0b)` and `valid calls=0`. Root cause:
+with reasoning on, `deepseek-v4-pro` sometimes puts its **entire** reply in
+the `thinking_content` channel and leaves `content` empty. With no tool
+call and no visible content, the proxy emitted a blank turn → agy had
+nothing to display.
+
+The fix is the `else if (!cleanedText && thinkingBuf.trim())` branch in
+`finish()` above: when there are no calls and no visible content, fall back
+to surfacing the buffered thinking text as the answer. If both are empty it
+logs a `WARNING: empty content and empty thinking — blank turn`.
 
 ### File 6 — `deepantigravity.sh` (Linux/macOS launcher)
 
@@ -521,6 +669,103 @@ data: {"v":"3"}
 
 ---
 
+## 4b. Emulated tool calling — the full round-trip
+
+The web endpoint accepts only a `prompt` and has **no native tool API**.
+agy, however, sends ~19 tool definitions every turn and expects structured
+`functionCall`s back. We bridge that gap with **prompt-based emulation**.
+
+### How a single tool turn flows
+
+```
+agy sends tools[] + messages
+   │
+   ▼
+forwardDeepSeekWeb:
+   prompt = buildToolInstructions(tools)   ← teaches the marker syntax
+          + flattenAnthToPrompt(messages)  ← prior <tool_call>/<tool_result> turns
+   │
+   ▼  POST /chat/completion  (one prompt, no tools field)
+   │
+   ▼  model streams text → we BUFFER it in contentBuf (don't stream)
+   │
+   ▼  on FINISHED:  extractToolCalls(contentBuf)
+        ├─ calls found → emit synthetic Anthropic tool_use blocks
+        │                (content_block_start → input_json_delta → stop)
+        │                stop_reason = "tool_use"
+        │                → AnthropicToGeminiStream → Gemini functionCall → agy RUNS it
+        └─ no calls    → emit the text as the answer (or thinking fallback)
+   │
+   ▼  agy executes the tool, sends the result back as a <tool_result>
+      on the NEXT turn → loop continues until the model answers with no marker.
+```
+
+### What the model actually emits (captured)
+
+A healthy tool turn (`view_file`):
+
+```
+<tool_call>{"name": "view_file", "arguments": {"AbsolutePath": "/tmp/x.txt", "toolSummary": "Read x", "toolAction": "Viewing file"}}</tool_call>
+```
+
+`extractToolCalls` parses that into `{name:"view_file", arguments:{…}}`,
+which becomes a Gemini `functionCall`. agy runs `view_file`, then sends the
+file contents back as `<tool_result>…</tool_result>` on the next turn.
+
+### Why buffer instead of stream?
+
+A `<tool_call>` marker can span many SSE frames. If we streamed each
+`content` delta straight through, agy would see half a marker as plain
+assistant text. So when `hasTools` is true we accumulate `contentBuf` and
+only decide text-vs-tool at `FINISHED`. (Without tools we stream directly —
+the fast path for plain `--print`.)
+
+### Known failure modes (inherent to emulation)
+
+- **Narration instead of a call.** The model occasionally describes the
+  action in prose (or in the thinking channel) and emits no marker. The
+  turn then has `valid calls=0`. It usually self-corrects on the next turn;
+  the system prompt's "do NOT just describe what you would do" reduces it.
+- **Format drift.** Handled by the tolerant `extractToolCalls` (§3 File 5f):
+  fenced-in-marker, bare-fenced, and bare-object shapes all parse.
+- **Empty/thinking-only reply.** Handled by the thinking fallback (§3 File 5g).
+
+---
+
+## 4c. Using skills (SKILL.md) on this backend
+
+`agy` has **no native "skill" system** — only VSCode-style plugins. A
+"skill" (e.g. Kiro/Claude-Code skills like `ui-ux-pro-max`,
+`system-design`, `ecc-guide`) is just **a `SKILL.md` of instructions plus
+optional scripts**. Because skills are *used through ordinary tools*
+(`view_file` to read the SKILL.md, `run_command` to run its scripts,
+`write_to_file` for artifacts), they work on the DeepSeek web backend as
+soon as emulated tool calling works — no extra code.
+
+Invoke a skill by pointing agy at the skill directory and asking it to use
+the skill:
+
+```bash
+SKILL=/path/to/skills/ui-ux-pro-max-skill
+./deepantigravity.sh -b deepseek -- --add-dir "$SKILL" \
+  --print "Read $SKILL/SKILL.md, then USE the skill: run its search.py via \
+           run_command with query 'saas dashboard' domain style. Show the output."
+```
+
+Two skill shapes, both verified working:
+
+| Skill shape | Example | Tools exercised |
+|---|---|---|
+| **script-backed** | `ui-ux-pro-max` (`search.py`) | `view_file` → `run_command` |
+| **instructions-only** | `ecc-guide`, `system-design` | `view_file` (+ `write_to_file` for artifacts) |
+
+The same caveat as all emulated tool use applies: skills with long
+multi-step workflows are less reliable than on a native API backend. Watch
+the tool log (§5.4) — a skill that "does nothing" is almost always a
+`valid calls=0` narration miss, not a parsing error.
+
+---
+
 ## 5. Test & verify
 
 ### 5.1 Solver unit-check (against a live challenge)
@@ -566,14 +811,19 @@ grep -E "deepseek web replied|POST https://chat.deepseek.com" \
 #   deepseek web replied: 200 OK
 ```
 
-### 5.4 Tool-emulation diagnostics
+### 5.4 Tool-emulation diagnostics (persistent log)
 
-With `DEEPANTIGRAVITY_DEBUG=1`, the proxy logs the full tool round-trip to
-the **session** log (not `last-proxy-*.log`):
+With `DEEPANTIGRAVITY_DEBUG=1`, the proxy appends the full tool round-trip
+to a **persistent** audit log via the `dsToolLog()` helper:
 
 ```bash
-grep "\[tools\]" proxy/.cache/sessions/deepseekOauthWeb/proxy.log
+grep "\[tools\]" proxy/.cache/deepseek-tools.log
 ```
+
+Why a dedicated file: the per-session `proxy.log` is **deleted when agy
+exits** (refcount → 0), which throws away the traces. `dsToolLog()` writes
+to `proxy/.cache/deepseek-tools.log` (disable with `DEEPSEEK_TOOL_LOG=0`),
+so it survives across runs — essential for per-tool/per-skill debugging.
 
 You'll see, per turn:
 
@@ -607,8 +857,11 @@ is **`valid calls=N`**:
 | HTML "Just a moment" / `403` | WAF blocked you — cookie missing/expired | re-copy the full `cookie:` (needs `aws-waf-token` + `ds_session_id`) |
 | `create_pow_challenge → HTTP 4xx` | cookie/token mismatch | refresh **both** secrets together from one browser session |
 | `PoW solve failed (wasm returned null)` on real challenges | wrong call convention or stale heap view | re-acquire memory view after malloc; check prefix `` `${salt}_${expire_at}_` `` |
-| answer streams but agy shows nothing | missing Gemini wrapper | ensure you feed synthetic Anthropic SSE through `AnthropicToGeminiStream`, don't hand-roll Gemini frames |
-| agentic tasks fail / agy aborts | web backend has no tool-calling | expected — use an API-key backend for agentic work |
+| answer streams but agy shows nothing | missing Gemini wrapper | feed synthetic Anthropic SSE through `AnthropicToGeminiStream`, don't hand-roll Gemini frames |
+| agy **describes** an action but never does it | emulation miss — model emitted no `<tool_call>` marker (log shows `valid calls=0` + prose) | re-run; usually self-corrects. The system-prompt "do NOT just describe" rule reduces it |
+| tool with nested args silently fails | old non-greedy `\{…?\}` regex truncated at first `}` | fixed: `extractToolCalls`/`findBalancedObjects` brace-match (§3 File 5f) |
+| model used a fenced/bare format, `NO calls extracted` | unhandled marker shape | `extractToolCalls` handles marker, fenced-in-marker, bare-fenced, bare-object; extend it for a new shape |
+| agy prints a **blank** turn | reply went entirely to the `thinking_content` channel | fixed: thinking fallback in `finish()` (§3 File 5g) |
 
 ---
 
@@ -616,15 +869,24 @@ is **`valid calls=N`**:
 
 | File | Change |
 |---|---|
-| `proxy/.env` / `.env.example` | `DEEPSEEK_OAUTH_WEB_TOKEN`, `_MODEL`, `_COOKIE` |
+| `proxy/.env` / `.env.example` | `DEEPSEEK_OAUTH_WEB_TOKEN`, `_MODEL`, `_COOKIE` (+ optional `_THINKING`) |
 | `proxy/start-proxy.js` | `BACKEND_DEFS.deepseekOauthWeb` → web host; `canonicalize()` aliases; pass `cookie:` to `startProxy` |
 | `proxy/deepseek-pow.js` | **new** — WASM sha3 PoW solver |
 | `proxy/wasm/sha3_wasm_bg.7b9ca65ddd.wasm` | **new** — vendored PoW module |
-| `proxy/model-proxy.js` | import solver; `DEEPSEEK_WEB` set; dispatch; `forwardDeepSeekWeb()` + helpers |
+| `proxy/model-proxy.js` | import solver; `DEEPSEEK_WEB` set + dispatch; `forwardDeepSeekWeb()`; tool emulation (`buildToolInstructions`, `extractToolCalls`, `findBalancedObjects`); thinking fallback; `dsToolLog()` audit log |
 | `deepantigravity.sh` | `canonicalize_backend()` aliases; `backend_ip()` → `127.0.30.1` |
+| `proxy/.cache/deepseek-tools.log` | runtime artifact — persistent tool diagnostics (debug-gated) |
 
-That's the entire surface. The reusable lesson: for any non-API web chat
-backend, write a thin forwarder that (1) handles the site's auth +
-anti-abuse, (2) flattens to a prompt, and (3) re-emits the stream as
-synthetic Anthropic SSE so the existing `AnthropicToGeminiStream` does the
-final Gemini formatting for free.
+That's the entire surface. The reusable lessons for any non-API web chat
+backend:
+
+1. Write a thin forwarder that handles the site's **auth + anti-abuse**
+   (token + cookie + per-turn PoW), flattens to one prompt, and re-emits
+   the stream as **synthetic Anthropic SSE** so the existing
+   `AnthropicToGeminiStream` does the Gemini formatting for free.
+2. If the site has no native tools, **emulate** them: describe the tools in
+   the prompt, ask for `<tool_call>` markers, then parse them back into
+   `functionCall`s with a **tolerant, brace-balanced** extractor (a single
+   regex will truncate nested arguments).
+3. With a reasoning model, always have an **empty-content fallback** —
+   surface the thinking text rather than handing the client a blank turn.
