@@ -839,8 +839,9 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
 
     upstream.on('error', (e) => {
         console.error(`[deepantigravity]     upstream connection FAILED: ${e.code || ''} ${e.message}`);
-        // Retry connection-level failures while nothing has been streamed.
-        if (attempt < MAX_ATTEMPTS && !res.headersSent) {
+        // Retry connection-level drops while nothing has been streamed,
+        // but NOT a full timeout (would multiply the wait by MAX_ATTEMPTS).
+        if (!upstream._timedOut && attempt < MAX_ATTEMPTS && !res.headersSent) {
             const delay = 400 * attempt;
             console.error(`[deepantigravity]     connection error — retry ${attempt}/${MAX_ATTEMPTS - 1} in ${delay}ms`);
             setTimeout(() => send(attempt + 1), delay);
@@ -852,9 +853,12 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
 
     // If the upstream stalls (model produces nothing for the whole
     // timeout window), destroy the socket so the error handler fires
-    // instead of leaving agy hanging forever.
+    // instead of leaving agy hanging forever. Mark it so the error
+    // handler does NOT retry — a full timeout shouldn't multiply the
+    // wait by MAX_ATTEMPTS.
     upstream.on('timeout', () => {
         console.error(`[deepantigravity]     upstream TIMED OUT after ${REQUEST_TIMEOUT_MS}ms (model produced no response)`);
+        upstream._timedOut = true;
         upstream.destroy(new Error(`upstream timeout after ${REQUEST_TIMEOUT_MS}ms`));
     });
 
@@ -865,6 +869,10 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
 
     send(1);
 }
+
+// Test-only export: lets the retry test drive the real forwardOpenAI
+// against a local mock upstream (no behavior change for the proxy).
+export const __test = { forwardOpenAI };
 
 
 // ════════════════════════════════════════════════════════════════

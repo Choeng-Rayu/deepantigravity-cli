@@ -165,6 +165,15 @@ function chatTemplateKwargsFor(model) {
  *      results.
  */
 function normalizeForOpenAI(msgs) {
+    // Pass 0: drop empty assistant messages (no content + no tool_calls).
+    // A reasoning model turn that produced ONLY a thinking block becomes
+    // {role:'assistant', content:null} after thinking is stripped. Strict
+    // OpenAI-compat backends (mistral, qwen, glm) 400 on an assistant
+    // message that has neither content nor tool_calls.
+    msgs = msgs.filter(m => !(m.role === 'assistant'
+        && (m.content === null || m.content === undefined || m.content === '')
+        && (!m.tool_calls || m.tool_calls.length === 0)));
+
     // Pass 1: merge consecutive assistant messages.
     const merged = [];
     for (const m of msgs) {

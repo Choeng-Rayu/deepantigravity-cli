@@ -90,8 +90,13 @@ export function geminiToAnthropic(geminiBody, targetModel) {
 
     // Convert each content turn
     for (const c of contents) {
-        const role = c.role === 'model' ? 'assistant' : 'user';
         const parts = c.parts || [];
+        // A turn carrying a functionResponse is a TOOL RESULT. agy
+        // sometimes labels these role:'model' (not 'user'); Anthropic
+        // requires tool_result blocks to live in a USER message, else the
+        // result is dropped and the model sees an empty tool output.
+        const hasFnResponse = parts.some(p => p.functionResponse);
+        const role = hasFnResponse ? 'user' : (c.role === 'model' ? 'assistant' : 'user');
         const blocks = [];
 
         for (const p of parts) {
