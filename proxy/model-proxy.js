@@ -533,6 +533,13 @@ async function forwardAndRewriteModels(req, res, body, upstreamHost, opts) {
                                 entry.maxTokens = 1048576;
                                 entry.supportsThinking = true;
                             }
+                            // nemotron-3-super-120b-a12b: real context is 1M
+                            // tokens (NVIDIA model card) — pin it so agy sizes
+                            // context correctly instead of inheriting the 2M
+                            // gemini-2.5-pro template.
+                            if (modelId.includes('nemotron-3-super-120b-a12b')) {
+                                entry.maxTokens = 1000000;
+                            }
                             models[key] = entry;
                             injectedKeys.push(key);
                         }
@@ -759,6 +766,16 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
         'content-length': Buffer.byteLength(body),
     };
 
+    // Retry transient upstream failures (5xx / connection drops) before
+    // any bytes are streamed to agy. Serverless backends (e.g. NVIDIA
+    // dynamo "instance_id not found") return a one-off 500 when a worker
+    // is recycled mid-request; agy aborts the whole turn on a single
+    // error, so one quiet retry keeps the session alive.
+    const MAX_ATTEMPTS = parseInt(process.env.DEEPANTIGRAVITY_RETRIES || '', 10) >= 0
+        ? parseInt(process.env.DEEPANTIGRAVITY_RETRIES, 10) + 1 : 3;
+    const isTransient = (code) => code === 500 || code === 502 || code === 503 || code === 504;
+
+    const send = (attempt) => {
     const upstream = reqLib({
         host: upstreamUrl.hostname,
         port: upstreamUrl.port || (isHttps ? 443 : 80),
@@ -770,11 +787,17 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
     }, (upRes) => {
         console.error(`[deepantigravity]     upstream replied: ${upRes.statusCode} ${upRes.statusMessage}`);
         if (upRes.statusCode !== 200) {
-            res.writeHead(upRes.statusCode, { 'content-type': 'application/json' });
             let errBody = '';
             upRes.on('data', c => { errBody += c.toString(); });
             upRes.on('end', () => {
                 console.error(`[deepantigravity]     upstream error body: ${errBody.slice(0, 500)}`);
+                // Retry transient errors while nothing has been streamed.
+                if (isTransient(upRes.statusCode) && attempt < MAX_ATTEMPTS && !res.headersSent) {
+                    const delay = 400 * attempt;
+                    console.error(`[deepantigravity]     transient ${upRes.statusCode} — retry ${attempt}/${MAX_ATTEMPTS - 1} in ${delay}ms`);
+                    setTimeout(() => send(attempt + 1), delay);
+                    return;
+                }
                 // Diagnostic: dump the message-role shape so 400s about
                 // tool-call/result pairing or ordering are self-evident.
                 try {
@@ -784,6 +807,7 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
                     ).join(' → ');
                     console.error(`[deepantigravity]     request msg shape: ${seq}`);
                 } catch {}
+                if (!res.headersSent) res.writeHead(upRes.statusCode, { 'content-type': 'application/json' });
                 res.end(errBody);
             });
             return;
@@ -815,6 +839,13 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
 
     upstream.on('error', (e) => {
         console.error(`[deepantigravity]     upstream connection FAILED: ${e.code || ''} ${e.message}`);
+        // Retry connection-level failures while nothing has been streamed.
+        if (attempt < MAX_ATTEMPTS && !res.headersSent) {
+            const delay = 400 * attempt;
+            console.error(`[deepantigravity]     connection error — retry ${attempt}/${MAX_ATTEMPTS - 1} in ${delay}ms`);
+            setTimeout(() => send(attempt + 1), delay);
+            return;
+        }
         if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: { code: 502, message: e.message } }));
     });
@@ -827,9 +858,12 @@ async function forwardOpenAI(res, anthBody, opts, geminiModel, onUsage) {
         upstream.destroy(new Error(`upstream timeout after ${REQUEST_TIMEOUT_MS}ms`));
     });
 
-    console.error(`[deepantigravity]     POST ${upstreamUrl.protocol}//${upstreamUrl.hostname}:${upstreamUrl.port || (isHttps ? 443 : 80)}${rebasePath(upstreamUrl.pathname, '/chat/completions')} (body=${body.length}b)`);
+    console.error(`[deepantigravity]     POST ${upstreamUrl.protocol}//${upstreamUrl.hostname}:${upstreamUrl.port || (isHttps ? 443 : 80)}${rebasePath(upstreamUrl.pathname, '/chat/completions')} (body=${body.length}b${attempt > 1 ? `, attempt ${attempt}` : ''})`);
     upstream.write(body);
     upstream.end();
+    };
+
+    send(1);
 }
 
 
